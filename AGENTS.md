@@ -1,0 +1,37 @@
+# Project Instructions
+
+## Scope
+
+本仓库实现 Pi 扩展 `pi-auto-compact`。保持实现围绕分层压缩、原文取回和 Pi 生命周期，不加入与上下文管理无关的功能。
+
+## Commands
+
+```bash
+npm test
+npm run typecheck
+npm pack --dry-run
+```
+
+## Invariants
+
+- 第一条 user entry 是会话目标，不得进入任何压缩块。
+- `CompactBlock` 不可变；高层块保留直接子块引用，低层块不删除。
+- `topLevelBlockIds` 只表示当前稳定投影；其他分支块不能参与当前分支重平衡。分支前沿索引只保存各活动路径的选择，不改变块仓库的不可变性。
+- `blockMergeThreshold = k` 表示出现第 `k + 1` 个连续同级块后合并最旧 `k` 个。
+- 摘要、全部连锁提升和 sidecar 写入成功后才能替换内存状态。
+- `REFERENCE_CONTEXT` 与 `TARGET_RANGE` 不重复，二者合起来覆盖摘要所需当前上下文。
+- 压缩块禁止 `Goal`，完整卡片不得超过 `blockTokenCeiling`，摘要不得硬截断。
+- `context_get` 必须校验当前活动分支并分页；`rawEntryJson` 保留完整 Pi `SessionEntry` 字段。
+- 自动扫描使用 Pi 当前可见 entry（原生 `compaction` 只作为参考摘要），完整 branch 仅用于目标身份、分支校验和原文取回。无论上下文是否已超窗口，自动扫描都从最早未压缩内容开始按摘要请求真实预算逐段推进；每个新块都会成为后续段的参考上下文。
+- `context` 事件和异步摘要提交必须校验当前会话路径未发生变化。
+- 自动和手动压缩都必须报告 token 进度；完成状态包含最新块信息。footer 的上下文占用必须基于插件实际投影，而不是未压缩 session 原文。
+
+## Pi Compatibility
+
+改扩展接口前先查本机 Pi 文档：
+
+```text
+/home/xenon/.local/share/fnm/node-versions/v24.16.0/installation/lib/node_modules/@earendil-works/pi-coding-agent/docs
+```
+
+核心 Pi 包和 `typebox` 保持在 `peerDependencies`；不要把本机绝对路径放入运行时依赖。

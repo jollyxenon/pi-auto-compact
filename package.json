@@ -1,0 +1,30 @@
+{
+	"name": "pi-auto-compact",
+	"version": "0.1.0",
+	"type": "module",
+	"description": "Hierarchical, losslessly retrievable context compaction for Pi",
+	"license": "MIT",
+	"keywords": ["pi-package", "pi-agent", "context", "compaction"],
+	"files": ["src", "README.md", "LICENSE"],
+	"scripts": {
+		"typecheck": "tsc --noEmit",
+		"test": "tsc --noEmit && node --test test/*.test.ts"
+	},
+	"peerDependencies": {
+		"@earendil-works/pi-agent-core": "*",
+		"@earendil-works/pi-coding-agent": "*",
+		"@earendil-works/pi-tui": "*",
+		"typebox": "*"
+	},
+	"devDependencies": {
+		"@earendil-works/pi-agent-core": "file:/home/xenon/.local/share/fnm/node-versions/v24.16.0/installation/lib/node_modules/@earendil-works/pi-coding-agent/node_modules/@earendil-works/pi-agent-core",
+		"@earendil-works/pi-coding-agent": "file:/home/xenon/.local/share/fnm/node-versions/v24.16.0/installation/lib/node_modules/@earendil-works/pi-coding-agent",
+		"@earendil-works/pi-tui": "file:/home/xenon/.local/share/fnm/node-versions/v24.16.0/installation/lib/node_modules/@earendil-works/pi-coding-agent/node_modules/@earendil-works/pi-tui",
+		"@types/node": "^24.0.0",
+		"typebox": "file:/home/xenon/.local/share/fnm/node-versions/v24.16.0/installation/lib/node_modules/@earendil-works/pi-coding-agent/node_modules/typebox",
+		"typescript": "^5.7.0"
+	},
+	"pi": {
+		"extensions": ["./src/index.ts"]
+	}
+}
