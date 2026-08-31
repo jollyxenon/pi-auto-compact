@@ -15,7 +15,11 @@ import { messageToText, type TokenEstimator } from "../src/util.ts";
 /** 与 Pi 的 estimateTokens 同规则（chars/4），内联以便测试自己掌握契约。 */
 const testEstimator: TokenEstimator = (message) => Math.max(1, Math.ceil(messageToText(message).length / 4));
 
-const VALID_SUMMARY = `## Constraints & Preferences
+const VALID_SUMMARY = `<overview>
+完成了所选历史工作的压缩，并保留后续继续所需的信息。
+</overview>
+
+## Constraints & Preferences
 - Keep exact source boundaries.
 
 ## Progress
@@ -120,13 +124,15 @@ test("the kth same-level block remains and the k+1th merges the oldest k", async
 	assert.equal(fourth.state.blocks.length, 5, "immutable child blocks remain stored");
 });
 
-test("manual adjustment promotes one through k adjacent blocks by one level", async () => {
+test("manual adjustment merges two through k adjacent same-level blocks", async () => {
 	const state = await compactTurns(2);
-	const firstId = state.topLevelBlockIds[0];
-	const outcome = await runManualAdjustment(deps(), state, [firstId]);
+	const outcome = await runManualAdjustment(deps(), state, state.topLevelBlockIds);
 	assert.ok(outcome.state, outcome.reason);
-	assert.deepEqual(topLevelLayout(outcome.state).map((item) => item.level), [2, 1]);
-	assert.deepEqual(outcome.createdBlocks?.[0].childBlockIds, [firstId]);
+	assert.deepEqual(topLevelLayout(outcome.state).map((item) => item.level), [2]);
+	assert.deepEqual(outcome.createdBlocks?.[0].childBlockIds, state.topLevelBlockIds);
+
+	const single = await runManualAdjustment(deps(), state, [state.topLevelBlockIds[0]]);
+	assert.match(single.reason ?? "", /between 2 and 3/);
 });
 
 test("maxBlocks is optional and constrains only the stable top-level layout", async () => {

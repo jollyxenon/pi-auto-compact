@@ -17,7 +17,11 @@ export const REQUIRED_PROGRESS_HEADINGS = ["### Done", "### In Progress", "### B
 export const SUMMARIZER_SYSTEM_PROMPT =
 	"You compress agent history. Follow the requested Markdown structure and source boundary exactly.";
 
-const STRUCTURE = `Return only this Markdown structure. Do not add a Goal section.
+const STRUCTURE = `Return only this format. OVERVIEW must be one sentence on one line, followed by the exact Markdown structure.
+
+<overview>
+A concrete one-sentence description of what this block summarizes.
+</overview>
 
 ## Constraints & Preferences
 - ...
@@ -55,6 +59,8 @@ Hard rules:
 - REFERENCE_CONTEXT is read-only background.
 - Summarize only facts, actions, decisions, and progress present in TARGET_RANGE.
 - Never output a Goal heading or restate the overall goal.
+- OVERVIEW must describe only TARGET_RANGE in one concrete sentence, on one line, no longer than 200 characters.
+- The detailed summary must start immediately after </overview>.
 - Do not invent IDs, paths, commands, results, or decisions.
 - The complete visible block card must fit within ${input.budgetTokens} tokens.
 - Source entry IDs: ${input.sourceEntryIds.join(", ")}
@@ -67,6 +73,24 @@ ${input.referenceContext}
 
 ===== TARGET_RANGE (ONLY SOURCE TO SUMMARIZE) =====
 ${input.targetRange}`;
+}
+
+export interface ParsedSummaryResponse {
+	overview: string;
+	summary: string;
+	problems: string[];
+}
+
+/** Split the model response into tree overview and context-card summary. */
+export function parseSummaryResponse(response: string): ParsedSummaryResponse {
+	const match = /^<overview>\s*\n([^\r\n]+)\n<\/overview>\s*\n([\s\S]+)$/.exec(response.trim());
+	if (!match) return { overview: "", summary: response.trim(), problems: ["missing exact overview block"] };
+	const overview = match[1].trim();
+	const problems: string[] = [];
+	if (!overview) problems.push("overview is empty");
+	if (overview.length > 200) problems.push("overview exceeds 200 characters");
+	if (/[\r\n]/.test(overview)) problems.push("overview must be one line");
+	return { overview, summary: match[2].trim(), problems };
 }
 
 export interface SummaryValidation {
@@ -107,8 +131,8 @@ export function validateSummary(summary: string, cardTokens: number, budgetToken
 	return { ok: problems.length === 0, overBudget, problems };
 }
 
-export function rewriteInstruction(validation: SummaryValidation): string {
-	return `\n\nThe previous output was invalid (${validation.problems.join("; ")}). Rewrite it once, preserve the exact structure, remove Goal, and shorten it to fit the card budget.`;
+export function rewriteInstruction(validation: SummaryValidation | { problems: string[] }): string {
+	return `\n\nThe previous output was invalid (${validation.problems.join("; ")}). Rewrite the entire response once, including a one-line <overview> block and the exact Markdown structure; remove Goal and fit the card budget.`;
 }
 
 /** Estimate the final visible card using the real message estimator. */

@@ -1,4 +1,4 @@
-/** Manual promotion tool for one through k adjacent same-level top blocks. */
+/** Manual merge tool for two through k adjacent same-level top blocks. */
 
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
@@ -20,17 +20,17 @@ export interface AdjustToolDeps {
 export function makeAdjustTool(deps: AdjustToolDeps) {
 	return {
 		name: "adjust_context_blocks",
-		label: "手动提升压缩块",
+		label: "手动合并压缩块",
 		description:
-			`Promote 1..${deps.cfg.blockMergeThreshold} adjacent, ordered, same-level top blocks into one block at the next level before automatic merging is due. The operation is atomic.`,
-		promptSnippet: "Manually promote adjacent same-level compact blocks",
+			`Merge 2..${deps.cfg.blockMergeThreshold} adjacent, ordered, same-level top blocks before automatic merging is due. An existing block with the same ordered leaves is reused. The operation is atomic.`,
+		promptSnippet: "Manually merge adjacent same-level compact blocks",
 		promptGuidelines: [
 			"Use adjust_context_blocks when visible historical blocks should be consolidated before the automatic k+1 merge condition.",
 		],
 		parameters: Type.Object({
 			blockIds: Type.Array(Type.String(), {
-				minItems: 1,
-				description: "Adjacent top-level block IDs in oldest-to-newest order; effective maximum is blockMergeThreshold",
+				minItems: 2,
+				description: "Adjacent top-level block IDs in oldest-to-newest order; choose 2 through blockMergeThreshold",
 			}),
 			focus: Type.Optional(Type.String({ description: "Facts from these blocks to emphasize" })),
 		}),

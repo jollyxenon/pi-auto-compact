@@ -3,12 +3,13 @@
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import type { SessionEntry } from "@earendil-works/pi-coding-agent";
 import { resolveTokenLimit, type AutoCompactConfig } from "./config.ts";
-import { activeTopBlocks } from "./mapping.ts";
+import { activeChildFrontier, activeTopBlocks } from "./mapping.ts";
 import {
+	SUMMARIZER_SYSTEM_PROMPT,
 	buildSummarizePrompt,
 	cardTokensFor,
+	parseSummaryResponse,
 	rewriteInstruction,
-	SUMMARIZER_SYSTEM_PROMPT,
 	validateSummary,
 } from "./summarizer.ts";
 import type { CompactBlock, PluginState, SummarizeInput } from "./types.ts";
@@ -297,27 +298,32 @@ async function summarizeBlock(
 	if (firstRequestTokens > deps.contextWindow) {
 		return { error: `summary request needs about ${firstRequestTokens} tokens, window is ${deps.contextWindow}` };
 	}
-	let summary = (await deps.summarizeFn(prompt)).trim();
-	let cardTokens = cardTokensFor(state.nextSeq, input, summary, deps.estimate);
-	let validation = validateSummary(summary, cardTokens, input.budgetTokens);
-	if (!validation.ok) {
-		const rewritePrompt = prompt + rewriteInstruction(validation);
+	let response = (await deps.summarizeFn(prompt)).trim();
+	let parsed = parseSummaryResponse(response);
+	let cardTokens = cardTokensFor(state.nextSeq, input, parsed.summary, deps.estimate);
+	let validation = validateSummary(parsed.summary, cardTokens, input.budgetTokens);
+	let problems = [...parsed.problems, ...validation.problems];
+	if (problems.length > 0) {
+		const rewritePrompt = prompt + rewriteInstruction({ problems });
 		const rewriteRequestTokens = summaryRequestTokensForPrompt(deps, rewritePrompt, input.budgetTokens);
 		if (rewriteRequestTokens > deps.contextWindow) {
 			return { error: `summary rewrite needs about ${rewriteRequestTokens} tokens, window is ${deps.contextWindow}` };
 		}
-		summary = (await deps.summarizeFn(rewritePrompt)).trim();
-		cardTokens = cardTokensFor(state.nextSeq, input, summary, deps.estimate);
-		validation = validateSummary(summary, cardTokens, input.budgetTokens);
+		response = (await deps.summarizeFn(rewritePrompt)).trim();
+		parsed = parseSummaryResponse(response);
+		cardTokens = cardTokensFor(state.nextSeq, input, parsed.summary, deps.estimate);
+		validation = validateSummary(parsed.summary, cardTokens, input.budgetTokens);
+		problems = [...parsed.problems, ...validation.problems];
 	}
-	if (!validation.ok) return { error: validation.problems.join("; ") };
+	if (problems.length > 0) return { error: problems.join("; ") };
 	return {
 		block: {
 			blockId: nextBlockId(state.nextSeq),
 			level: input.level,
+			overview: parsed.overview,
 			sourceEntryIds: [...input.sourceEntryIds],
 			childBlockIds: [...input.childBlockIds],
-			summary,
+			summary: parsed.summary,
 			createdAt: new Date().toISOString(),
 			sourceTokens: input.sourceTokens,
 			cardTokens,
@@ -334,15 +340,19 @@ function addTopBlock(state: PluginState, block: CompactBlock, positions: Map<str
 			- (positions.get(b?.sourceEntryIds[0] ?? "") ?? Number.MAX_SAFE_INTEGER);
 	});
 	return {
-		schemaVersion: 1,
+		...state,
 		blocks: [...state.blocks, block],
 		topLevelBlockIds: top,
-		topLevelBlockIdsByBranch: state.topLevelBlockIdsByBranch,
 		nextSeq: state.nextSeq + 1,
 	};
 }
 
-function replaceTopGroup(state: PluginState, groupIds: string[], merged: CompactBlock): PluginState {
+function replaceTopGroup(
+	state: PluginState,
+	groupIds: string[],
+	merged: CompactBlock,
+	created: boolean,
+): PluginState {
 	const indexes = groupIds.map((id) => state.topLevelBlockIds.indexOf(id));
 	const first = Math.min(...indexes);
 	const last = Math.max(...indexes);
@@ -351,21 +361,25 @@ function replaceTopGroup(state: PluginState, groupIds: string[], merged: Compact
 		throw new Error("blocks to promote must be adjacent top-level blocks");
 	}
 	return {
-		schemaVersion: 1,
-		blocks: [...state.blocks, merged],
+		...state,
+		blocks: created ? [...state.blocks, merged] : state.blocks,
 		topLevelBlockIds: [
 			...state.topLevelBlockIds.slice(0, first),
 			merged.blockId,
 			...state.topLevelBlockIds.slice(last + 1),
 		],
-		topLevelBlockIdsByBranch: state.topLevelBlockIdsByBranch,
-		nextSeq: state.nextSeq + 1,
+		nextSeq: created ? state.nextSeq + 1 : state.nextSeq,
 	};
 }
 
-function validateMergeGroup(deps: CompressDeps, state: PluginState, groupIds: string[]): CompactBlock[] | string {
+function validateMergeGroup(
+	deps: CompressDeps,
+	state: PluginState,
+	groupIds: string[],
+	requireSameLevel = true,
+): CompactBlock[] | string {
 	const k = deps.cfg.blockMergeThreshold;
-	if (groupIds.length < 1 || groupIds.length > k) return `choose between 1 and ${k} blocks`;
+	if (groupIds.length < 2 || groupIds.length > k) return `choose between 2 and ${k} blocks`;
 	const topIndexes = groupIds.map((id) => state.topLevelBlockIds.indexOf(id));
 	if (topIndexes.some((index) => index < 0)) return "all blocks must be top-level";
 	const first = Math.min(...topIndexes);
@@ -374,7 +388,9 @@ function validateMergeGroup(deps: CompressDeps, state: PluginState, groupIds: st
 	const blocks = groupIds.map((id) => byId.get(id));
 	if (blocks.some((block) => !block)) return "block not found";
 	const concrete = blocks as CompactBlock[];
-	if (concrete.some((block) => block.level !== concrete[0].level)) return "blocks must have the same level";
+	if (requireSameLevel && concrete.some((block) => block.level !== concrete[0].level)) {
+		return "blocks must have the same level";
+	}
 	const entries = sourceEntries(deps);
 	const positions = new Map(entries.map((entry, index) => [entry.id, index] as const));
 	for (let i = 1; i < concrete.length; i++) {
@@ -385,22 +401,34 @@ function validateMergeGroup(deps: CompressDeps, state: PluginState, groupIds: st
 	return concrete;
 }
 
+/** Promote adjacent blocks, reusing the immutable node with the same ordered leaves. */
 async function promoteGroup(
 	deps: CompressDeps,
 	state: PluginState,
 	groupIds: string[],
 	focus?: string,
 	boundReference = false,
-): Promise<{ state?: PluginState; block?: CompactBlock; error?: string }> {
-	const checked = validateMergeGroup(deps, state, groupIds);
+	requireSameLevel = true,
+): Promise<{ state?: PluginState; block?: CompactBlock; created?: boolean; error?: string }> {
+	const checked = validateMergeGroup(deps, state, groupIds, requireSameLevel);
 	if (typeof checked === "string") return { error: checked };
+	const leaves = groupIds.flatMap((id) => leafBlockIds(state, id));
+	const reusable = state.blocks.find((block) => {
+		const candidateLeaves = leafBlockIds(state, block.blockId);
+		return candidateLeaves.length === leaves.length
+			&& candidateLeaves.every((id, index) => id === leaves[index]);
+	});
+	if (reusable) {
+		return { state: replaceTopGroup(state, groupIds, reusable, false), block: reusable, created: false };
+	}
+
 	const sourceEntryIds = checked.flatMap((block) => block.sourceEntryIds);
 	const sourceTokens = checked.reduce((sum, block) => sum + block.sourceTokens, 0);
 	const base: Omit<SummarizeInput, "referenceContext"> = {
 		targetRange: checked.map((block) => `[${block.blockId} level ${block.level}]\n${block.summary}`).join("\n\n"),
 		sourceEntryIds,
 		sourceTokens,
-		level: checked[0].level + 1,
+		level: Math.max(...checked.map((block) => block.level)) + 1,
 		childBlockIds: checked.map((block) => block.blockId),
 		budgetTokens: deps.cfg.blockTokenCeiling,
 		focus,
@@ -416,7 +444,7 @@ async function promoteGroup(
 	if (!prepared.fits) return { error: `summary request needs about more than the available context window (${deps.contextWindow} tokens)` };
 	const result = await summarizeBlock(deps, state, prepared.input);
 	if (!result.block) return { error: result.error ?? "summary failed" };
-	return { state: replaceTopGroup(state, groupIds, result.block), block: result.block };
+	return { state: replaceTopGroup(state, groupIds, result.block, true), block: result.block, created: true };
 }
 
 interface SameLevelRun {
@@ -466,7 +494,7 @@ async function stabilize(
 			const promoted = await promoteGroup(deps, state, automatic.ids.slice(0, k), undefined, boundReference);
 			if (!promoted.state || !promoted.block) return { blocks: created, error: promoted.error };
 			state = promoted.state;
-			created.push(promoted.block);
+			if (promoted.created) created.push(promoted.block);
 			continue;
 		}
 		const max = deps.cfg.maxBlocks;
@@ -478,29 +506,31 @@ async function stabilize(
 			const promoted = await promoteGroup(deps, state, reducible.ids.slice(0, Math.min(k, reducible.ids.length)), undefined, boundReference);
 			if (!promoted.state || !promoted.block) return { blocks: created, error: promoted.error };
 			state = promoted.state;
-			created.push(promoted.block);
+			if (promoted.created) created.push(promoted.block);
 			continue;
 		}
 
-		// Under maxBlocks pressure, promoting one lower adjacent block is legal and
-		// eventually creates a reducible same-level pair (for example L3,L2,L1 -> L3,L2,L2).
-		const layout = state.topLevelBlockIds.map((id) => {
-			const block = state.blocks.find((candidate) => candidate.blockId === id);
-			if (!block) throw new Error(`top-level block ${id} is missing`);
-			return block;
-		});
-		let promoteIndex = -1;
-		for (let i = 0; i < layout.length - 1; i++) {
-			if (layout[i].level !== layout[i + 1].level) {
-				promoteIndex = layout[i].level < layout[i + 1].level ? i : i + 1;
-				break;
+		// Mixed-level, source-contiguous neighbors can share a parent without a unary node.
+		const entries = sourceEntries(deps);
+		const positions = new Map(entries.map((entry, index) => [entry.id, index] as const));
+		let pressureIds: string[] | undefined;
+		for (let start = 0; start < state.topLevelBlockIds.length - 1 && !pressureIds; start++) {
+			const ids = [state.topLevelBlockIds[start]];
+			for (let end = start + 1; end < state.topLevelBlockIds.length && ids.length < k; end++) {
+				const previous = state.blocks.find((block) => block.blockId === ids.at(-1));
+				const current = state.blocks.find((block) => block.blockId === state.topLevelBlockIds[end]);
+				const previousEnd = positions.get(previous?.sourceEntryIds.at(-1) ?? "");
+				const currentStart = positions.get(current?.sourceEntryIds[0] ?? "");
+				if (!previous || !current || previousEnd === undefined || currentStart !== previousEnd + 1) break;
+				ids.push(current.blockId);
 			}
+			if (ids.length >= 2) pressureIds = ids;
 		}
-		if (promoteIndex < 0) return { blocks: created, error: `cannot satisfy maxBlocks=${max.value}` };
-		const promoted = await promoteGroup(deps, state, [state.topLevelBlockIds[promoteIndex]], undefined, boundReference);
+		if (!pressureIds) return { blocks: created, error: `cannot satisfy maxBlocks=${max.value}` };
+		const promoted = await promoteGroup(deps, state, pressureIds, undefined, boundReference, false);
 		if (!promoted.state || !promoted.block) return { blocks: created, error: promoted.error };
 		state = promoted.state;
-		created.push(promoted.block);
+		if (promoted.created) created.push(promoted.block);
 	}
 }
 
@@ -511,6 +541,7 @@ function occupiedSourceIds(entries: SessionEntry[], state: PluginState): Set<str
 interface ScopedState {
 	state: PluginState;
 	branchFrontiers: Record<string, string[]>;
+	branchChildFrontiers: Record<string, Record<string, string[]>>;
 }
 
 /** Select the current branch frontier, then isolate the temporary operation state. */
@@ -520,9 +551,17 @@ function scopeToActiveBranch(
 	frontierEntries: SessionEntry[] = entries,
 ): ScopedState {
 	const activeIds = activeTopBlocks(frontierEntries, state).map((block) => block.blockId);
+	const activeChildren = activeChildFrontier(frontierEntries, state);
 	return {
-		state: { ...state, topLevelBlockIds: activeIds, topLevelBlockIdsByBranch: undefined },
+		state: {
+			...state,
+			topLevelBlockIds: activeIds,
+			childBlockIdsByParent: activeChildren,
+			topLevelBlockIdsByBranch: undefined,
+			childBlockIdsByParentByBranch: undefined,
+		},
 		branchFrontiers: { ...(state.topLevelBlockIdsByBranch ?? {}) },
+		branchChildFrontiers: { ...(state.childBlockIdsByParentByBranch ?? {}) },
 	};
 }
 
@@ -530,6 +569,7 @@ function rememberBranchFrontier(
 	deps: CompressDeps,
 	state: PluginState,
 	branchFrontiers: Record<string, string[]>,
+	branchChildFrontiers: Record<string, Record<string, string[]>>,
 ): PluginState {
 	const keys = new Set<string>();
 	const addKey = (entry: SessionEntry | undefined): void => {
@@ -539,8 +579,14 @@ function rememberBranchFrontier(
 	addKey(currentContextEntries(deps).at(-1));
 	addKey(sourceEntries(deps).at(-1));
 	const topLevelBlockIdsByBranch = { ...branchFrontiers };
-	for (const key of keys) topLevelBlockIdsByBranch[key] = [...state.topLevelBlockIds];
-	return { ...state, topLevelBlockIdsByBranch };
+	const childBlockIdsByParentByBranch = { ...branchChildFrontiers };
+	for (const key of keys) {
+		topLevelBlockIdsByBranch[key] = [...state.topLevelBlockIds];
+		childBlockIdsByParentByBranch[key] = Object.fromEntries(
+			Object.entries(state.childBlockIdsByParent).map(([parentId, childIds]) => [parentId, [...childIds]]),
+		);
+	}
+	return { ...state, topLevelBlockIdsByBranch, childBlockIdsByParentByBranch };
 }
 
 interface AutoCandidate {
@@ -844,12 +890,12 @@ export async function runAutoCompression(deps: CompressDeps, inputState: PluginS
 		const normalized = inputState.topLevelBlockIds.length !== working.topLevelBlockIds.length
 			|| inputState.topLevelBlockIds.some((id, index) => id !== working.topLevelBlockIds[index]);
 		return normalized
-			? { status: "skipped", state: rememberBranchFrontier(deps, working, scoped.branchFrontiers), reason: "no compressible entries" }
+			? { status: "skipped", state: rememberBranchFrontier(deps, working, scoped.branchFrontiers, scoped.branchChildFrontiers), reason: "no compressible entries" }
 			: { status: "skipped", reason: "no compressible entries" };
 	}
 	return {
 		status: "created",
-		state: rememberBranchFrontier(deps, working, scoped.branchFrontiers),
+		state: rememberBranchFrontier(deps, working, scoped.branchFrontiers, scoped.branchChildFrontiers),
 		createdBlocks,
 	};
 }
@@ -899,12 +945,12 @@ export async function runManualCompression(
 	if (stable.blocks.length > 0) reportProgress(deps, sourceTokens, sourceTokens, stable.blocks);
 	return {
 		status: "created",
-		state: rememberBranchFrontier(deps, stable.state, scoped.branchFrontiers),
+		state: rememberBranchFrontier(deps, stable.state, scoped.branchFrontiers, scoped.branchChildFrontiers),
 		createdBlocks: [created.block, ...stable.blocks],
 	};
 }
 
-/** Manually promote one through k adjacent same-level top blocks by exactly one level. */
+/** Manually merge two through k adjacent same-level top blocks. */
 export async function runManualAdjustment(
 	deps: CompressDeps,
 	inputState: PluginState,
@@ -924,61 +970,133 @@ export async function runManualAdjustment(
 	if (stable.blocks.length > 0) reportProgress(deps, totalTokens, totalTokens, stable.blocks);
 	return {
 		status: "adjusted",
-		state: rememberBranchFrontier(deps, stable.state, scoped.branchFrontiers),
-		createdBlocks: [promoted.block, ...stable.blocks],
+		state: rememberBranchFrontier(deps, stable.state, scoped.branchFrontiers, scoped.branchChildFrontiers),
+		createdBlocks: [...(promoted.created ? [promoted.block] : []), ...stable.blocks],
 	};
 }
 
-/** Manually split a top-level block into its children, or split a level-1 source range at a turn boundary. */
-export async function runManualSplit(
+/** Return the ordered level-1 leaves covered by an immutable block. */
+function leafBlockIds(state: PluginState, blockId: string, visiting = new Set<string>()): string[] {
+	if (visiting.has(blockId)) throw new Error("block graph contains a cycle");
+	const block = state.blocks.find((candidate) => candidate.blockId === blockId);
+	if (!block) throw new Error(`block ${blockId} is missing`);
+	if (block.level === 1) return [blockId];
+	const next = new Set(visiting).add(blockId);
+	return block.childBlockIds.flatMap((childId) => leafBlockIds(state, childId, next));
+}
+
+/** Resolve the currently selected children of a parent. */
+function selectedChildIds(state: PluginState, parentId: string): string[] {
+	const parent = state.blocks.find((block) => block.blockId === parentId);
+	if (!parent) throw new Error(`parent block ${parentId} is missing`);
+	return state.childBlockIdsByParent[parentId] ?? parent.childBlockIds;
+}
+
+/** Replace adjacent siblings while preserving their parent block and all immutable old nodes. */
+function replaceTreeSiblings(
+	state: PluginState,
+	parentId: string | undefined,
+	groupIds: string[],
+	replacementIds: string[],
+): PluginState | string {
+	const siblings = parentId === undefined ? state.topLevelBlockIds : selectedChildIds(state, parentId);
+	const first = siblings.indexOf(groupIds[0] ?? "");
+	if (first < 0 || groupIds.some((id, offset) => siblings[first + offset] !== id)) {
+		return "blocks must be adjacent siblings in their displayed order";
+	}
+	const next = [...siblings.slice(0, first), ...replacementIds, ...siblings.slice(first + groupIds.length)];
+	if (parentId === undefined) return { ...state, topLevelBlockIds: next };
+	return {
+		...state,
+		childBlockIdsByParent: { ...state.childBlockIdsByParent, [parentId]: next },
+	};
+}
+
+/** Merge displayed siblings, reusing an immutable block with the same ordered leaves when possible. */
+export async function runTreeMerge(
 	deps: CompressDeps,
 	inputState: PluginState,
-	blockId: string,
-	splitAt?: string,
+	parentId: string | undefined,
+	blockIds: string[],
+	focus?: string,
 ): Promise<CompressOutcome> {
 	const source = sourceEntries(deps);
 	const scoped = scopeToActiveBranch(source, inputState, currentContextEntries(deps));
-	const block = scoped.state.blocks.find((candidate) => candidate.blockId === blockId);
-	if (!block || !scoped.state.topLevelBlockIds.includes(blockId)) {
-		return { status: "error", reason: "block must be an active top-level block" };
+	const state = scoped.state;
+	const checked = replaceTreeSiblings(state, parentId, blockIds, []);
+	if (typeof checked === "string") return { status: "error", reason: checked };
+	const selected = blockIds.map((id) => state.blocks.find((block) => block.blockId === id));
+	if (selected.some((block) => !block)) return { status: "error", reason: "block not found" };
+	const concrete = selected as CompactBlock[];
+	if (concrete.length < 2 || concrete.length > deps.cfg.blockMergeThreshold) {
+		return { status: "error", reason: `choose between 2 and ${deps.cfg.blockMergeThreshold} blocks` };
 	}
-	const totalTokens = block.sourceTokens;
-	reportProgress(deps, 0, totalTokens);
-	if (block.childBlockIds.length > 0) {
-		const childIds = block.childBlockIds.filter((id) => scoped.state.blocks.some((candidate) => candidate.blockId === id));
-		if (childIds.length !== block.childBlockIds.length) return { status: "error", reason: "block children are missing" };
-		const index = scoped.state.topLevelBlockIds.indexOf(blockId);
-		const next: PluginState = {
-			...scoped.state,
-			topLevelBlockIds: [...scoped.state.topLevelBlockIds.slice(0, index), ...childIds, ...scoped.state.topLevelBlockIds.slice(index + 1)],
-		};
-		const adjusted = rememberBranchFrontier(deps, next, scoped.branchFrontiers);
-		reportProgress(deps, totalTokens, totalTokens, childIds.map((id) => scoped.state.blocks.find((candidate) => candidate.blockId === id)).filter((candidate): candidate is CompactBlock => candidate !== undefined));
-		return { status: "adjusted", state: adjusted, createdBlocks: [] };
+	if (concrete.some((block) => block.level !== concrete[0].level)) {
+		return { status: "error", reason: "blocks must have the same level" };
 	}
-	if (!splitAt) return { status: "error", reason: "a split entry ID is required for a level-1 block" };
+	const parent = parentId === undefined ? undefined : state.blocks.find((block) => block.blockId === parentId);
+	if (parentId !== undefined && (!parent || concrete[0].level + 1 >= parent.level)) {
+		return { status: "error", reason: "merged block must remain below its parent level" };
+	}
 	const positions = new Map(source.map((entry, index) => [entry.id, index] as const));
-	const from = positions.get(block.sourceEntryIds[0]);
-	const boundary = positions.get(splitAt);
-	const to = positions.get(block.sourceEntryIds.at(-1) ?? "");
-	if (from === undefined || boundary === undefined || to === undefined || boundary < from || boundary >= to) {
-		return { status: "error", reason: "split entry must be inside the block source range" };
+	for (let index = 1; index < concrete.length; index++) {
+		const previous = positions.get(concrete[index - 1].sourceEntryIds.at(-1) ?? "");
+		const current = positions.get(concrete[index].sourceEntryIds[0]);
+		if (previous === undefined || current !== previous + 1) {
+			return { status: "error", reason: "blocks must cover contiguous source entries" };
+		}
 	}
-	if (!isTurnBoundary(source, boundary)) return { status: "error", reason: "split entry must end a complete turn" };
-	const without: PluginState = {
-		...scoped.state,
-		topLevelBlockIds: scoped.state.topLevelBlockIds.filter((id) => id !== blockId),
-	};
-	const first = await createLevelOne(deps, without, from, boundary);
-	if (!first.state || !first.block) return { status: "error", reason: first.error };
-	reportProgress(deps, first.block.sourceTokens, totalTokens, [first.block]);
-	const second = await createLevelOne(deps, first.state, boundary + 1, to);
-	if (!second.state || !second.block) return { status: "error", reason: second.error };
-	reportProgress(deps, totalTokens, totalTokens, [second.block]);
+	const leaves = blockIds.flatMap((id) => leafBlockIds(state, id));
+	if (parentId !== undefined) {
+		const parentLeaves = leafBlockIds(state, parentId);
+		if (parentLeaves.length === leaves.length && parentLeaves.every((id, index) => id === leaves[index])) {
+			return { status: "error", reason: "cannot merge a parent's complete coverage into the parent itself" };
+		}
+	}
+	const temporary = { ...state, topLevelBlockIds: blockIds };
+	const promoted = await promoteGroup(deps, temporary, blockIds, focus);
+	if (!promoted.state || !promoted.block) return { status: "error", reason: promoted.error };
+	const merged = promoted.block;
+	if (parent && merged.level >= parent.level) {
+		return { status: "error", reason: "merged block must remain below its parent level" };
+	}
+	const repository = { ...state, blocks: promoted.state.blocks, nextSeq: promoted.state.nextSeq };
+	const replaced = replaceTreeSiblings(repository, parentId, blockIds, [merged.blockId]);
+	if (typeof replaced === "string") return { status: "error", reason: replaced };
+	const totalTokens = concrete.reduce((sum, block) => sum + block.sourceTokens, 0);
+	reportProgress(deps, totalTokens, totalTokens, [merged]);
+	const stable = parentId === undefined ? await stabilize(deps, replaced) : { state: replaced, blocks: [] };
+	if (!stable.state) return { status: "error", reason: stable.error };
+	if (stable.blocks.length > 0) reportProgress(deps, totalTokens, totalTokens, stable.blocks);
 	return {
 		status: "adjusted",
-		state: rememberBranchFrontier(deps, second.state, scoped.branchFrontiers),
-		createdBlocks: [first.block, second.block],
+		state: rememberBranchFrontier(deps, stable.state, scoped.branchFrontiers, scoped.branchChildFrontiers),
+		createdBlocks: [...(promoted.created ? [merged] : []), ...stable.blocks],
+	};
+}
+
+/** Expand any displayed non-leaf block without changing its parent or ancestors. */
+export async function runTreeSplit(
+	deps: CompressDeps,
+	inputState: PluginState,
+	parentId: string | undefined,
+	blockId: string,
+): Promise<CompressOutcome> {
+	const source = sourceEntries(deps);
+	const scoped = scopeToActiveBranch(source, inputState, currentContextEntries(deps));
+	const state = scoped.state;
+	const block = state.blocks.find((candidate) => candidate.blockId === blockId);
+	if (!block) return { status: "error", reason: "block not found" };
+	const childIds = selectedChildIds(state, blockId);
+	if (childIds.length === 0) return { status: "error", reason: "level-1 leaves cannot be split in the tree editor" };
+	const replaced = replaceTreeSiblings(state, parentId, [blockId], childIds);
+	if (typeof replaced === "string") return { status: "error", reason: replaced };
+	reportProgress(deps, block.sourceTokens, block.sourceTokens, childIds.map((id) =>
+		state.blocks.find((candidate) => candidate.blockId === id)).filter((candidate): candidate is CompactBlock => candidate !== undefined));
+	return {
+		status: "adjusted",
+		state: rememberBranchFrontier(deps, replaced, scoped.branchFrontiers, scoped.branchChildFrontiers),
+		createdBlocks: [],
 	};
 }
 

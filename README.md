@@ -82,7 +82,7 @@ pi -e /home/xenon/pi-auto-compact
 ## 输入框命令
 
 - `/auto-compact`：从当前可见上下文的最早可处理位置重新扫描，把目标 entry 之后、受保护尾部之前的所有尚未压缩完整区间逐块处理；已有压缩块会先参与稳定和升层。完整操作成功后才提交状态。
-- `/auto-compact-blocks`：交互式展示当前顶层压缩块的顺序、层级和直接子块关系，然后选择合并或拆分。合并需要输入连续顶层块 ID；拆分高层块会恢复其直接子块，拆分 level-1 块会重新摘要为两个块。拆分 level-1 块时只能选择回合边界（用户消息开头或工具调用/结果成对完整处），拆分不套用 `minNetGainTokens` 门槛。
+- `/auto-compact-blocks`：以当前活动分支的顶层块为根，交互式展示当前使用的完整压缩块树。每个块显示 ID、层级和生成时保存的一句话概述；使用上下键浏览、左右键折叠或展开、Enter 打开操作、Esc 退出。可拆开任意可见高层块，让它当前选中的子块在原父节点下就地展开；也可把同一父节点下连续、同级的兄弟块合并。level-1 是固定叶子，不在树编辑器中继续拆分。高层节点由它覆盖的有序 level-1 叶子序列识别：只改内部树边不会重做祖先摘要；再次组合出已有叶子序列时直接复用仓库中的旧块，不调用摘要模型。
 - `/auto-compact-config`：交互式调整 auto-compact 配置。`自动压缩` 控制是否响应上下文阈值和溢出事件；关闭后仍可使用手动压缩命令和工具。百分比/绝对值与对应数值是分开的设置项；空格或 Tab 切换单位、开关和预设值，直接输入可填写自定义数值，Enter/Ctrl+S 保存，Ctrl+C/Esc 取消。`运行时调试日志` 控制是否写入 Pi 的 `~/.pi/agent/pi-debug.log`。
 
 ## 工具
@@ -103,7 +103,7 @@ pi -e /home/xenon/pi-auto-compact
 
 ### `adjust_context_blocks`
 
-提前把 1 到 `blockMergeThreshold` 个相邻、同级、顶层块提升一级：
+提前把 2 到 `blockMergeThreshold` 个相邻、同级、顶层块合并。若仓库中已有相同有序叶子序列的块，则直接复用已有摘要：
 
 ```json
 {
@@ -159,7 +159,7 @@ pi -e /home/xenon/pi-auto-compact
 - `REFERENCE_CONTEXT`：目标范围之外的会话目标、其他历史块、近期原文和其他扩展注入消息，只用于理解术语和因果。对于已经超过模型窗口的会话，插件按完整 entry 或完整块卡片缩小这一部分；原始完整内容仍保留在 session JSONL 中。
 - `TARGET_RANGE`：本次唯一允许写入摘要的来源。目标范围本身不会被硬截断；如果最小完整区间仍无法放入摘要请求，整次自动操作失败并保持旧状态。
 
-摘要采用固定 Markdown 结构：`Constraints & Preferences`、`Progress`、`Key Decisions`、`Next Steps`、`Critical Context` 和文件索引。完整可见卡片必须不超过 `blockTokenCeiling`；第一次输出不合格时重写一次，仍不合格则整次操作回滚。插件不会硬截断摘要。
+摘要采用固定输出协议：模型先生成不超过 200 字符的一句话概述，供 `/auto-compact-blocks` 的树视图显示；随后生成 `Constraints & Preferences`、`Progress`、`Key Decisions`、`Next Steps`、`Critical Context` 和文件索引组成的详细 Markdown 摘要。两者在同一次模型请求中生成，概述只写入块元数据，不进入投影给模型的块卡片。完整可见卡片必须不超过 `blockTokenCeiling`；第一次输出不合格时重写一次，仍不合格则整次操作回滚。插件不会硬截断摘要。
 
 ## 状态与故障语义
 
@@ -169,7 +169,7 @@ pi -e /home/xenon/pi-auto-compact
 <session>.autocompact.json
 ```
 
-原始消息仍在 Pi 的 append-only session JSONL 中。sidecar 使用临时文件加 rename 写入；同时按活动路径保存顶层前沿，切换分支时不会让其他分支参与当前投影。写入、摘要或任一级提升失败时，当前内存投影保持不变。sidecar 无法解析或结构校验失败（缺少字段、块 ID 重复、子块引用不存在、序号回退）时，原文件重命名为 `<session>.autocompact.json.corrupt-<时间戳>` 留存排查，插件从空状态重建。
+原始消息仍在 Pi 的 append-only session JSONL 中。当前 sidecar schema 为 3；旧 schema 升级后会按无效旧结构隔离为 `.corrupt-<时间戳>`，再从空状态重建。sidecar 使用临时文件加 rename 写入；同时按活动路径保存顶层前沿和每个父节点当前选中的子前沿，切换分支时不会让其他分支参与当前投影或树结构。写入、摘要或任一级提升失败时，当前内存投影保持不变。sidecar 无法解析或结构校验失败（缺少字段、块 ID 重复、子块引用不存在、序号回退）时，原文件重命名为 `<session>.autocompact.json.corrupt-<时间戳>` 留存排查，插件从空状态重建。
 
 插件取消 Pi 原生压缩，但如果上下文已经溢出且插件自身没有产出任何压缩状态（例如摘要失败），会放行 Pi 原生 overflow compaction 作为兑底，避免会话卡死。若配置让受保护尾部本身接近或超过模型窗口，自动压缩将找不到可处理区间；此时应降低 `keepRecent` 或 `trigger`，再执行 `/auto-compact-config`。
 

@@ -2,6 +2,7 @@
 
 import * as fs from "node:fs";
 import * as path from "node:path";
+import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import {
 	buildSessionContext,
 	estimateTokens,
@@ -10,18 +11,31 @@ import {
 	type ExtensionContext,
 	type SessionEntry,
 } from "@earendil-works/pi-coding-agent";
-import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import { makeAdjustTool } from "./adjustTool.ts";
 import { makeCompactTool } from "./compactTool.ts";
-import { runAutoCompression, runManualAdjustment, runManualSplit, isTurnBoundary, topLevelLayout, type CompressDeps, type CompressOutcome, type CompressProgress } from "./compress.ts";
+import {
+	runAutoCompression,
+	runTreeMerge,
+	runTreeSplit,
+	type CompressDeps,
+	type CompressOutcome,
+	type CompressProgress,
+} from "./compress.ts";
 import { defaultConfig, loadConfig, resolveTokenLimit, saveConfig, type AutoCompactConfig } from "./config.ts";
 import { makeContextGetTool } from "./contextGet.ts";
-import { activeTopBlocks, buildMapping, projectMessages, projectSessionEntries } from "./mapping.ts";
+import { activeChildFrontier, activeTopBlocks, buildMapping, projectMessages, projectSessionEntries } from "./mapping.ts";
 import { loadState, saveState, statePathFor } from "./state.ts";
 import { SUMMARIZER_SYSTEM_PROMPT } from "./summarizer.ts";
 import { freshState, type PluginState } from "./types.ts";
 import { messageToText, renderBlockCard } from "./util.ts";
-import { choiceForm, installAutoCompactFooter, type ChoiceItem, type ProjectedContextUsage, showCompressionProgress } from "./tui.ts";
+import {
+	blockTree,
+	choiceForm,
+	installAutoCompactFooter,
+	showCompressionProgress,
+	type ChoiceItem,
+	type ProjectedContextUsage,
+} from "./tui.ts";
 
 export default function autoCompactExtension(pi: ExtensionAPI) {
 	const cfg = defaultConfig();
@@ -65,9 +79,11 @@ export default function autoCompactExtension(pi: ExtensionAPI) {
 		sessionLeafId = leaf;
 		const visible = ctx.sessionManager.buildContextEntries();
 		const activeIds = activeTopBlocks(visible, state).map((block) => block.blockId);
+		const activeChildren = activeChildFrontier(visible, state);
 		if (activeIds.length !== state.topLevelBlockIds.length
-			|| activeIds.some((blockId, index) => blockId !== state.topLevelBlockIds[index])) {
-			const next = { ...state, topLevelBlockIds: activeIds };
+			|| activeIds.some((blockId, index) => blockId !== state.topLevelBlockIds[index])
+			|| JSON.stringify(activeChildren) !== JSON.stringify(state.childBlockIdsByParent)) {
+			const next = { ...state, topLevelBlockIds: activeIds, childBlockIdsByParent: activeChildren };
 			if (statePath) saveState(statePath, next);
 			state = next;
 		}
@@ -103,35 +119,60 @@ export default function autoCompactExtension(pi: ExtensionAPI) {
 		const branchIds = new Set(branchEntries.map((entry) => entry.id));
 		const parentById = new Map(parent.blocks.map((block) => [block.blockId, block] as const));
 		const valid = (blockId: string) => parentById.get(blockId)?.sourceEntryIds.every((id) => branchIds.has(id)) ?? false;
-		const frontier = (blockId: string): string[] => {
+		const parentFrontiers = parent.topLevelBlockIdsByBranch ?? { __root__: parent.topLevelBlockIds };
+		const childFrontierAt = (key: string): Record<string, string[]> => {
+			if (key === "__root__") return activeChildFrontier([], parent);
+			const index = branchEntries.findIndex((entry) => entry.id === key);
+			return activeChildFrontier(index < 0 ? branchEntries : branchEntries.slice(0, index + 1), parent);
+		};
+		const descend = (blockId: string, children: Record<string, string[]>): string[] => {
 			if (valid(blockId)) return [blockId];
 			const block = parentById.get(blockId);
-			return block ? block.childBlockIds.flatMap(frontier) : [];
+			return block ? (children[blockId] ?? block.childBlockIds).flatMap((childId) => descend(childId, children)) : [];
 		};
-		const parentFrontiers = parent.topLevelBlockIdsByBranch ?? { __root__: parent.topLevelBlockIds };
 		let seedFrontier = parent.topLevelBlockIds;
+		let seedKey = "__root__";
 		for (let index = branchEntries.length - 1; index >= 0; index--) {
-			const candidate = parentFrontiers[branchEntries[index]?.id ?? ""];
+			const key = branchEntries[index]?.id ?? "";
+			const candidate = parentFrontiers[key];
 			if (candidate) {
 				seedFrontier = candidate;
+				seedKey = key;
 				break;
 			}
 		}
-		const topLevelBlockIds = seedFrontier.flatMap(frontier);
+		const topLevelBlockIds = seedFrontier.flatMap((id) => descend(id, childFrontierAt(seedKey)));
 		const blocks = parent.blocks.filter((block) => block.sourceEntryIds.every((id) => branchIds.has(id)));
 		const topLevelBlockIdsByBranch: Record<string, string[]> = {};
 		for (const [key, ids] of Object.entries(parentFrontiers)) {
 			if (key !== "__root__" && !branchIds.has(key)) continue;
-			const frontierIds = ids.flatMap(frontier);
+			const children = childFrontierAt(key);
+			const frontierIds = ids.flatMap((id) => descend(id, children));
 			if (frontierIds.length > 0) topLevelBlockIdsByBranch[key] = frontierIds;
 		}
 		const leafId = ctx.sessionManager.getLeafId() ?? "__root__";
 		topLevelBlockIdsByBranch[leafId] = [...topLevelBlockIds];
+		const inheritedBlockIds = new Set(blocks.map((block) => block.blockId));
+		const filterChildren = (frontier: Record<string, string[]>): Record<string, string[]> => Object.fromEntries(
+			Object.entries(frontier).filter(([parentId, childIds]) =>
+				inheritedBlockIds.has(parentId) && childIds.every((childId) => inheritedBlockIds.has(childId))),
+		);
+		const parentChildFrontiers = parent.childBlockIdsByParentByBranch
+			?? { __root__: parent.childBlockIdsByParent };
+		const childBlockIdsByParentByBranch: Record<string, Record<string, string[]>> = {};
+		for (const [key, frontierValue] of Object.entries(parentChildFrontiers)) {
+			if (key !== "__root__" && !branchIds.has(key)) continue;
+			childBlockIdsByParentByBranch[key] = filterChildren(frontierValue);
+		}
+		const childBlockIdsByParent = filterChildren(activeChildFrontier(branchEntries, parent));
+		childBlockIdsByParentByBranch[leafId] = childBlockIdsByParent;
 		const inherited: PluginState = {
-			schemaVersion: 1,
+			schemaVersion: 3,
 			blocks,
 			topLevelBlockIds,
+			childBlockIdsByParent,
 			topLevelBlockIdsByBranch,
+			childBlockIdsByParentByBranch,
 			nextSeq: parent.nextSeq,
 		};
 		saveState(statePath, inherited);
@@ -335,15 +376,6 @@ export default function autoCompactExtension(pi: ExtensionAPI) {
 		return limit.mode === "percent" ? "百分比" : "绝对值";
 	}
 
-	function blockLayout(ctx: ExtensionContext): string {
-		ensureSession(ctx);
-		const byId = new Map(state.blocks.map((block) => [block.blockId, block] as const));
-		return topLevelLayout(state).map(({ id, level }, index) => {
-			const block = byId.get(id);
-			return `${index + 1}. ${id} [L${level}] ${block?.childBlockIds.length ? `children: ${block.childBlockIds.join(", ")}` : `entries: ${block?.sourceEntryIds[0] ?? "?"}..${block?.sourceEntryIds.at(-1) ?? "?"}`}`;
-		}).join("\n") || "(当前没有压缩块)";
-	}
-
 	pi.registerCommand("auto-compact", {
 		description: "Compress all currently uncompressed complete ranges before the protected recent tail",
 		handler: async (_args, ctx) => {
@@ -362,21 +394,33 @@ export default function autoCompactExtension(pi: ExtensionAPI) {
 	});
 
 	pi.registerCommand("auto-compact-blocks", {
-		description: "Inspect and split or merge auto-compact blocks",
+		description: "Inspect the active auto-compact block tree and split or merge its roots",
 		handler: async (_args, ctx) => {
 			if (!ctx.hasUI) return;
-			const action = await ctx.ui.select(`当前压缩块关系\n${blockLayout(ctx)}\n\n选择操作`, ["合并压缩块", "拆分压缩块", "取消"]);
-			if (!action || action === "取消") return;
-			const visible = topLevelLayout(state);
-			if (action === "合并压缩块") {
-				const choices = visible.map(({ id, level }) => ({ id, label: `${id} [L${level}]`, value: "选择", selected: false }));
-				const selected = await choiceForm(ctx, "选择要合并的连续顶层块", choices, (items) => items.filter((item) => item.selected).map((item) => item.id));
-				if (!selected?.length) return;
+			ensureSession(ctx);
+			const selected = await blockTree(ctx, state);
+			if (!selected) return;
+			const block = selected.block;
+			const action = await ctx.ui.select(`${block.blockId} [L${block.level}]\n${block.overview}\n\n选择操作`, ["合并相邻兄弟块", "拆分此块", "返回"]);
+			if (!action || action === "返回") return;
+			const parent = selected.parentId
+				? state.blocks.find((candidate) => candidate.blockId === selected.parentId)
+				: undefined;
+			const siblingIds = parent
+				? state.childBlockIdsByParent[parent.blockId] ?? parent.childBlockIds
+				: state.topLevelBlockIds;
+			if (action === "合并相邻兄弟块") {
+				const choices = siblingIds.map((id) => {
+					const sibling = state.blocks.find((candidate) => candidate.blockId === id);
+					return { id, label: `${id} [L${sibling?.level ?? 0}] ${sibling?.overview ?? ""}`, value: "选择", selected: id === block.blockId };
+				});
+				const selectedIds = await choiceForm(ctx, "选择要合并的连续同级兄弟块", choices, (items) => items.filter((item) => item.selected).map((item) => item.id));
+				if (!selectedIds?.length) return;
 				await runExclusive(async () => {
 					beginCompression(ctx);
 					const deps = buildCompressDeps(ctx);
 					if (!deps) throw new Error("没有可用的模型或上下文窗口");
-					const outcome = await runManualAdjustment(deps, state, selected);
+					const outcome = await runTreeMerge(deps, state, selected.parentId, selectedIds);
 					if (!outcome.state) throw new Error(outcome.reason);
 					commitState(outcome.state, ctx, deps.sessionKey);
 					finishCompression(ctx, outcome);
@@ -384,37 +428,14 @@ export default function autoCompactExtension(pi: ExtensionAPI) {
 					failCompression(ctx, error);
 					throw error;
 				});
-				ctx.ui.notify(`已合并 ${selected.join(", ")}`, "info");
+				ctx.ui.notify(`已合并 ${selectedIds.join(", ")}`, "info");
 				return;
-			}
-			const choices = visible.map(({ id, level }) => ({ id, label: `${id} [L${level}]`, value: "不拆分", selected: false }));
-			const selected = await choiceForm(ctx, "选择一个要拆分的顶层块", choices, (items) => items.find((item) => item.selected)?.id);
-			if (!selected) return;
-			const block = state.blocks.find((item) => item.blockId === selected);
-			if (!block) return;
-			let splitAt: string | undefined;
-			if (block.childBlockIds.length === 0) {
-				const branch = ctx.sessionManager.getBranch();
-				const positions = new Map(branch.map((entry, index) => [entry.id, index] as const));
-				// 只提供回合边界；任意消息边界会让两个新块看起来重叠。
-				const boundaries = block.sourceEntryIds.slice(0, -1)
-					.filter((id) => {
-						const position = positions.get(id);
-						return position !== undefined && isTurnBoundary(branch, position);
-					})
-					.map((id) => ({ id, label: id, value: "边界", selected: false }));
-				if (boundaries.length === 0) {
-					ctx.ui.notify(`${selected} 内没有可用的回合边界，无法拆分。`, "warning");
-					return;
-				}
-				splitAt = await choiceForm(ctx, `选择 ${selected} 的拆分边界`, boundaries, (items) => items.find((item) => item.selected)?.id);
-				if (!splitAt) return;
 			}
 			await runExclusive(async () => {
 				beginCompression(ctx);
 				const deps = buildCompressDeps(ctx);
 				if (!deps) throw new Error("没有可用的模型或上下文窗口");
-				const outcome = await runManualSplit(deps, state, selected, splitAt);
+				const outcome = await runTreeSplit(deps, state, selected.parentId, block.blockId);
 				if (!outcome.state) throw new Error(outcome.reason);
 				commitState(outcome.state, ctx, deps.sessionKey);
 				finishCompression(ctx, outcome);
@@ -422,7 +443,7 @@ export default function autoCompactExtension(pi: ExtensionAPI) {
 				failCompression(ctx, error);
 				throw error;
 			});
-			ctx.ui.notify(`已拆分 ${selected}`, "info");
+			ctx.ui.notify(`已拆分 ${block.blockId}`, "info");
 		},
 	});
 

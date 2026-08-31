@@ -3,6 +3,8 @@
 export interface CompactBlock {
 	blockId: string;
 	level: number;
+	/** One-line description used by block-tree inspection. */
+	overview: string;
 	/** Ordered original Pi session entry IDs covered by this block. */
 	sourceEntryIds: string[];
 	/** Direct children. Empty only for level-1 blocks. */
@@ -15,18 +17,22 @@ export interface CompactBlock {
 }
 
 export interface PluginState {
-	schemaVersion: 1;
+	schemaVersion: 3;
 	/** Immutable block repository. Children remain available after promotion. */
 	blocks: CompactBlock[];
 	/** Ordered blocks currently projected into the model context. */
 	topLevelBlockIds: string[];
-	/** Stable frontiers keyed by active-path entry IDs; the current frontier remains above. */
+	/** Active child frontier for parents whose visible edges differ from their creation edges. */
+	childBlockIdsByParent: Record<string, string[]>;
+	/** Stable root frontiers keyed by active-path entry IDs. */
 	topLevelBlockIdsByBranch?: Record<string, string[]>;
+	/** Stable internal edge selections keyed by active-path entry IDs. */
+	childBlockIdsByParentByBranch?: Record<string, Record<string, string[]>>;
 	nextSeq: number;
 }
 
 export function freshState(): PluginState {
-	return { schemaVersion: 1, blocks: [], topLevelBlockIds: [], nextSeq: 1 };
+	return { schemaVersion: 3, blocks: [], topLevelBlockIds: [], childBlockIdsByParent: {}, nextSeq: 1 };
 }
 
 export interface EntryMessageMapping {

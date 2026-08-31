@@ -50,6 +50,17 @@ function frontierIdsForEntries(entries: SessionEntry[], state: PluginState): str
 	return byBranch.__root__ ?? null;
 }
 
+/** Return the internal edge selection stored for the current branch. */
+export function activeChildFrontier(entries: SessionEntry[], state: PluginState): Record<string, string[]> {
+	const byBranch = state.childBlockIdsByParentByBranch;
+	if (!byBranch || Object.keys(byBranch).length === 0) return state.childBlockIdsByParent;
+	for (let index = entries.length - 1; index >= 0; index--) {
+		const frontier = byBranch[entries[index]?.id ?? ""];
+		if (frontier) return frontier;
+	}
+	return byBranch.__root__ ?? {};
+}
+
 /** Return active top-level blocks in source order for the current branch. */
 export function activeTopBlocks(entries: SessionEntry[], state: PluginState): CompactBlock[] {
 	const position = new Map(entries.map((entry, index) => [entry.id, index] as const));

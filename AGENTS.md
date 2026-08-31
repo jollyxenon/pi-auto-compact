@@ -15,8 +15,8 @@ npm pack --dry-run
 ## Invariants
 
 - 第一条 user entry 是会话目标，不得进入任何压缩块。
-- `CompactBlock` 不可变；高层块保留直接子块引用，低层块不删除。
-- `topLevelBlockIds` 只表示当前稳定投影；其他分支块不能参与当前分支重平衡。分支前沿索引只保存各活动路径的选择，不改变块仓库的不可变性。
+- `CompactBlock` 不可变；高层块保留创建时的直接子块引用，低层块不删除。节点身份由其有序 level-1 叶子序列决定；再次形成相同叶子序列时复用旧块，不重新摘要。每个新块在同一次摘要请求中生成单行 `overview` 和详细 `summary`；`overview` 只用于块树检查，不进入模型上下文卡片。
+- `topLevelBlockIds` 与 `childBlockIdsByParent` 只表示当前稳定树投影；其他分支块不能参与当前分支重平衡。分支前沿索引保存各活动路径的根前沿和内部子前沿选择，不改变块仓库的不可变性。
 - `blockMergeThreshold = k` 表示出现第 `k + 1` 个连续同级块后合并最旧 `k` 个。
 - 摘要、全部连锁提升和 sidecar 写入成功后才能替换内存状态。
 - `REFERENCE_CONTEXT` 与 `TARGET_RANGE` 不重复，二者合起来覆盖摘要所需当前上下文。

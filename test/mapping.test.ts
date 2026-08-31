@@ -17,6 +17,7 @@ const entry = {
 const block: CompactBlock = {
 	blockId: "ac_000001",
 	level: 1,
+	overview: "概括原始消息。",
 	sourceEntryIds: ["e1"],
 	childBlockIds: [],
 	summary: "summary",

@@ -1,6 +1,14 @@
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { Key, matchesKey, truncateToWidth, type Component, visibleWidth } from "@earendil-works/pi-tui";
+import {
+	Key,
+	matchesKey,
+	truncateToWidth,
+	type Component,
+	visibleWidth,
+	wrapTextWithAnsi,
+} from "@earendil-works/pi-tui";
 import type { CompressProgress } from "./compress.ts";
+import type { CompactBlock, PluginState } from "./types.ts";
 
 export interface ProjectedContextUsage {
 	tokens: number;
@@ -107,6 +115,92 @@ function formatTokens(count: number): string {
 	if (count < 10000) return `${(count / 1000).toFixed(1)}k`;
 	if (count < 1000000) return `${Math.round(count / 1000)}k`;
 	return `${(count / 1000000).toFixed(1)}M`;
+}
+
+export interface BlockTreeRow {
+	block: CompactBlock;
+	parentId?: string;
+	depth: number;
+	isLast: boolean;
+	ancestorHasNext: boolean[];
+}
+
+/** Return the currently selected children of a block in the active tree. */
+export function activeChildIds(state: PluginState, block: CompactBlock): string[] {
+	return state.childBlockIdsByParent[block.blockId] ?? block.childBlockIds;
+}
+
+/** Build the visible active forest while retaining child blocks in source order. */
+export function visibleBlockTree(state: PluginState, collapsed: ReadonlySet<string>): BlockTreeRow[] {
+	const byId = new Map(state.blocks.map((block) => [block.blockId, block] as const));
+	const rows: BlockTreeRow[] = [];
+	const visit = (blockId: string, parentId: string | undefined, depth: number, isLast: boolean, ancestorHasNext: boolean[]): void => {
+		const block = byId.get(blockId);
+		if (!block) return;
+		rows.push({ block, parentId, depth, isLast, ancestorHasNext });
+		if (collapsed.has(blockId)) return;
+		const childIds = activeChildIds(state, block);
+		childIds.forEach((childId, index) => {
+			visit(childId, blockId, depth + 1, index === childIds.length - 1, [...ancestorHasNext, !isLast]);
+		});
+	};
+	state.topLevelBlockIds.forEach((blockId, index) => {
+		visit(blockId, undefined, 0, index === state.topLevelBlockIds.length - 1, []);
+	});
+	return rows;
+}
+
+/** Inspect the active block hierarchy with Pi-tree-style navigation and folding. */
+export async function blockTree(ctx: ExtensionContext, state: PluginState): Promise<BlockTreeRow | undefined> {
+	return ctx.ui.custom<BlockTreeRow | undefined>((tui, theme, _keybindings, done) => {
+		const collapsed = new Set<string>();
+		let cursor = 0;
+		const pageSize = 16;
+		const component: Component = {
+			render(width: number): string[] {
+				const rows = visibleBlockTree(state, collapsed);
+				if (rows.length === 0) return [theme.fg("accent", theme.bold("压缩块树")), "", theme.fg("dim", "(当前分支没有压缩块)"), "", theme.fg("dim", "Esc 退出")];
+				cursor = Math.min(cursor, rows.length - 1);
+				const from = Math.max(0, Math.min(cursor - Math.floor(pageSize / 2), rows.length - pageSize));
+				const shown = rows.slice(from, from + pageSize);
+				const lines = [theme.fg("accent", theme.bold("压缩块树")), theme.fg("dim", `${rows.length} 个块，${state.topLevelBlockIds.length} 个当前顶层根`), ""];
+				for (const [offset, row] of shown.entries()) {
+					const index = from + offset;
+					const indent = row.ancestorHasNext.slice(0, -1).map((hasNext) => hasNext ? "│  " : "   ").join("");
+					const branch = row.depth === 0 ? "" : row.isLast ? "└─ " : "├─ ";
+					const fold = activeChildIds(state, row.block).length === 0 ? "  " : collapsed.has(row.block.blockId) ? "▸ " : "▾ ";
+					const marker = index === cursor ? "> " : "  ";
+					const prefix = `${marker}${indent}${branch}${fold}${row.block.blockId} [L${row.block.level}] `;
+					const overviewWidth = Math.max(8, width - visibleWidth(prefix));
+					const overview = truncateToWidth(row.block.overview, overviewWidth, "...");
+					lines.push(truncateToWidth(index === cursor ? theme.fg("accent", prefix + overview) : prefix + overview, width, "..."));
+				}
+				const current = rows[cursor].block;
+				const first = current.sourceEntryIds[0] ?? "?";
+				const last = current.sourceEntryIds.at(-1) ?? "?";
+				lines.push("", theme.fg("muted", `${current.blockId} · L${current.level} · ${first}..${last} · ${current.sourceTokens} tokens`));
+				lines.push(...wrapTextWithAnsi(current.overview, Math.max(1, width)).map((line) => theme.fg("text", line)));
+				lines.push("", theme.fg("dim", "↑↓ 浏览  ← 折叠  → 展开  Enter 操作  Esc 退出"));
+				return lines;
+			},
+			handleInput(data: string): void {
+				const rows = visibleBlockTree(state, collapsed);
+				if (rows.length === 0) {
+					if (matchesKey(data, Key.escape) || data === "\u0003") done(undefined);
+					return;
+				}
+				if (matchesKey(data, Key.up)) cursor = (cursor + rows.length - 1) % rows.length;
+				else if (matchesKey(data, Key.down)) cursor = (cursor + 1) % rows.length;
+				else if (matchesKey(data, Key.left)) collapsed.add(rows[cursor].block.blockId);
+				else if (matchesKey(data, Key.right)) collapsed.delete(rows[cursor].block.blockId);
+				else if (matchesKey(data, Key.enter)) done(rows[cursor]);
+				else if (matchesKey(data, Key.escape) || data === "\u0003") done(undefined);
+				tui.requestRender();
+			},
+			invalidate(): void {},
+		};
+		return component;
+	});
 }
 
 export interface ChoiceItem {
