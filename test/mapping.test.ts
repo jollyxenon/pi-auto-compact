@@ -18,7 +18,8 @@ const block: CompactBlock = {
 	blockId: "ac_000001",
 	level: 1,
 	overview: "概括原始消息。",
-	sourceEntryIds: ["e1"],
+	startEntryId: "e1",
+	endEntryId: "e1",
 	childBlockIds: [],
 	summary: "summary",
 	createdAt: "2026-01-01T00:00:00.000Z",
@@ -43,7 +44,7 @@ test("mapping preserves messages injected by another context extension", () => {
 	assert.match((projected[1] as { content: string }).content, /ac_000001/);
 });
 
-test("mapping preserves an injected message inside a compacted source span", () => {
+test("mapping discards an injected message inside a compacted source span", () => {
 	const secondMessage = { role: "user", content: "second", timestamp: 1 } as AgentMessage;
 	const secondEntry = {
 		type: "message",
@@ -61,9 +62,8 @@ test("mapping preserves an injected message inside a compacted source span", () 
 	} as AgentMessage;
 	const mapping = buildMapping([entry, secondEntry], [original, injected, secondMessage]);
 	assert.ok(mapping);
-	const covering = { ...block, sourceEntryIds: ["e1", "e2"] };
+	const covering = { ...block, endEntryId: "e2" };
 	const projected = projectMessages([original, injected, secondMessage], mapping, [covering]);
-	assert.equal(projected.length, 2);
+	assert.equal(projected.length, 1);
 	assert.match((projected[0] as { content: string }).content, /ac_000001/);
-	assert.equal(projected[1], injected);
 });

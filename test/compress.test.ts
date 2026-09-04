@@ -19,33 +19,37 @@ const VALID_SUMMARY = `<overview>
 完成了所选历史工作的压缩，并保留后续继续所需的信息。
 </overview>
 
-## Constraints & Preferences
-- Keep exact source boundaries.
-
-## Progress
-### Done
+<progress>
+<done>
 - [x] Completed the selected historical work.
-### In Progress
+</done>
+<doing>
 - [ ] None
-### Blocked
+</doing>
+<todo>
+- Continue with the recent context.
+</todo>
+</progress>
+
+<blocked>
 - None
+</blocked>
 
-## Key Decisions
-- **Scope**: Only the target range was summarized.
+<decision>
+- Scope: only the target range was summarized. (user)
+</decision>
 
-## Next Steps
-1. Continue with the recent context.
-
-## Critical Context
+<critical_content>
 - Original entries remain retrievable.
+</critical_content>
 
-<read-files>
+<read_files>
 (none)
-</read-files>
+</read_files>
 
-<modified-files>
+<modified_files>
 (none)
-</modified-files>`;
+</modified_files>`;
 
 function entries(turns = 5): SessionEntry[] {
 	const result: SessionEntry[] = [];
@@ -93,6 +97,7 @@ function deps(
 		cfg,
 		branchEntries,
 		contextWindow: 100_000,
+		systemPrompt: "test system prompt",
 		referenceContext: "complete visible projection",
 		estimate: testEstimator,
 		summarizeFn,
@@ -155,7 +160,7 @@ test("a merge summary failure leaves the input state unchanged", async () => {
 	assert.equal(JSON.stringify(state), before);
 });
 
-test("automatic compaction preserves a goal preceded by metadata and accepts one-entry turns", async () => {
+test("automatic compaction starts at the first context-visible message after metadata", async () => {
 	const branch: SessionEntry[] = [
 		{ type: "model_change", id: "meta", parentId: null, timestamp: "2026-01-01T00:00:00.000Z", provider: "x", modelId: "y" } as SessionEntry,
 		{ type: "message", id: "goal", parentId: "meta", timestamp: "2026-01-01T00:00:01.000Z", message: { role: "user", content: "SECRET GOAL", timestamp: 0 } } as SessionEntry,
@@ -170,11 +175,12 @@ test("automatic compaction preserves a goal preceded by metadata and accepts one
 	}, branch);
 	const automatic = await runAutoCompression(operation, freshState());
 	assert.ok(automatic.state, automatic.reason);
-	assert.deepEqual(automatic.createdBlocks?.[0].sourceEntryIds, ["done", "current"]);
-	assert.doesNotMatch(prompt.split("TARGET_RANGE (ONLY SOURCE TO SUMMARIZE)")[1] ?? "", /SECRET GOAL/);
+	assert.equal(automatic.createdBlocks?.[0].startEntryId, "goal");
+	assert.equal(automatic.createdBlocks?.[0].endEntryId, "current");
+	assert.match(/<target_compaction_range>\n([\s\S]*?)\n<\/target_compaction_range>/.exec(prompt)?.[1] ?? "", /SECRET GOAL/);
 
 	const manual = await runManualCompression(operation, freshState(), "meta", "done");
-	assert.match(manual.reason ?? "", /goal/);
+	assert.ok(manual.state, manual.reason);
 });
 
 test("summary request budget is checked before calling the model", async () => {
@@ -190,9 +196,8 @@ test("summary request budget is checked before calling the model", async () => {
 	assert.equal(called, false);
 });
 
-test("manual compaction rejects goal, overlap, and incomplete tail", async () => {
+test("manual compaction rejects overlap and incomplete tail", async () => {
 	const state = await compactTurns(1);
-	assert.match((await runManualCompression(deps(), state, "e0", "e0")).reason ?? "", /goal/);
 	assert.match((await runManualCompression(deps(), state, "e1", "e3")).reason ?? "", /overlaps/);
 	assert.match((await runManualCompression(deps(), state, "e11", "e11")).reason ?? "", /incomplete/);
 });

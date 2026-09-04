@@ -5,7 +5,9 @@ import { buildSummarizePrompt, validateSummary } from "../src/summarizer.ts";
 import type { SummarizeInput } from "../src/types.ts";
 
 const input: SummarizeInput = {
-	referenceContext: "outside fact: do not copy",
+	systemPrompt: "You are the coding agent.",
+	referenceAbove: "above fact: do not copy",
+	referenceBelow: "below fact: do not copy either",
 	targetRange: "inside fact: summarize this",
 	sourceEntryIds: ["e1", "e2"],
 	sourceTokens: 2000,
@@ -14,33 +16,39 @@ const input: SummarizeInput = {
 	budgetTokens: 500,
 };
 
-const valid = `## Constraints & Preferences
-- A
-## Progress
-### Done
+const valid = `<progress>
+<done>
 - [x] B
-### In Progress
+</done>
+<doing>
 - [ ] C
-### Blocked
+</doing>
+<todo>
+- E
+</todo>
+</progress>
+<blocked>
 - None
-## Key Decisions
-- D
-## Next Steps
-1. E
-## Critical Context
+</blocked>
+<decision>
+- D (user)
+</decision>
+<critical_content>
 - F
-<read-files>
+</critical_content>
+<read_files>
 (none)
-</read-files>
-<modified-files>
+</read_files>
+<modified_files>
 (none)
-</modified-files>`;
+</modified_files>`;
 
 test("summary prompt separates reference and target source boundaries", () => {
 	const prompt = buildSummarizePrompt(input);
-	assert.match(prompt, /REFERENCE_CONTEXT \(READ ONLY\)/);
-	assert.match(prompt, /TARGET_RANGE \(ONLY SOURCE TO SUMMARIZE\)/);
-	assert.match(prompt, /Never output a Goal heading/);
+	assert.match(prompt, /<reference_above>/);
+	assert.match(prompt, /<target_compaction_range>/);
+	assert.match(prompt, /<reference_below>/);
+	assert.match(prompt, /DO NOT expand the compression range outward/);
 });
 
 test("summary validation rejects Goal and the complete-card token overflow", () => {
