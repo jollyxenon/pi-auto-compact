@@ -1,7 +1,7 @@
 /** Atomic hierarchical compaction operations. No function mutates its input state. */
 
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
-import type { SessionEntry } from "@earendil-works/pi-coding-agent";
+import { sessionEntryToContextMessages, type SessionEntry } from "@earendil-works/pi-coding-agent";
 import { resolveTokenLimit, type AutoCompactConfig } from "./config.ts";
 import { activeChildFrontier, activeTopBlocks } from "./mapping.ts";
 import {
@@ -27,19 +27,21 @@ export interface CompressDeps {
 	cfg: AutoCompactConfig;
 	/** Session identity captured before asynchronous summary work begins. */
 	sessionKey?: string;
-	/** Full active branch, retained for goal identity and source provenance. */
+	/** Full active branch, retained for source provenance. */
 	branchEntries: SessionEntry[];
 	/** Current Pi context-visible entries; defaults to the full branch for tests/callers. */
 	contextEntries?: SessionEntry[];
-	/** Stable ID of the session's first user goal when older native compaction hid it. */
-	goalEntryId?: string;
 	contextWindow: number;
 	referenceContext: string;
+	/** Active session system prompt; shown as read-only reference. */
+	systemPrompt: string;
 	estimate: TokenEstimator;
 	onProgress?: (progress: CompressProgress) => void;
 	summarizeFn: (prompt: string) => Promise<string>;
 	/** Per-operation memo of serialized entry text and its token estimate; filled lazily. */
 	entryCache?: Map<string, { text: string; tokens: number }>;
+	/** Abort signal shared by every model request in this operation. */
+	signal?: AbortSignal;
 }
 
 export interface CompressOutcome {
@@ -89,6 +91,7 @@ function rangeTokens(index: EntryIndex, from: number, to: number): number {
 
 interface ReferencePart {
 	text: string;
+	region: "above" | "below";
 	order: number;
 	priority: number;
 	rank: number;
@@ -100,6 +103,17 @@ interface PreparedInput {
 }
 
 const SUMMARY_REWRITE_RESERVE = 256;
+
+/** Stop an operation before it can produce or commit a result. */
+function throwIfAborted(deps: CompressDeps): void {
+	if (deps.signal?.aborted) throw new Error("compression aborted");
+}
+
+/** Identify cancellation separately from model and validation failures. */
+export function isCompressionAborted(error: unknown, signal?: AbortSignal): boolean {
+	return signal?.aborted === true
+		|| (error instanceof Error && (error.name === "AbortError" || error.message === "compression aborted"));
+}
 
 /** Return the context-visible path, reconstructing Pi's native compaction projection when needed. */
 function currentContextEntries(deps: CompressDeps): SessionEntry[] {
@@ -128,9 +142,10 @@ function sourceEntries(deps: CompressDeps): SessionEntry[] {
 	return currentContextEntries(deps).filter((entry) => entry.type !== "compaction");
 }
 
-/** Resolve the immutable session goal even when a native compaction hid it. */
-function sessionGoalId(deps: CompressDeps): string | undefined {
-	return deps.goalEntryId ?? firstGoalEntryId(deps.branchEntries);
+/** Return the first session entry that contributes a message to the LLM context. */
+function firstCompressibleIndex(entries: SessionEntry[]): number {
+	const index = entries.findIndex((entry) => sessionEntryToContextMessages(entry).length > 0);
+	return index < 0 ? entries.length : index;
 }
 
 /** Estimate a plain text fragment with the same estimator used for messages. */
@@ -159,10 +174,6 @@ export function isTurnBoundary(entries: SessionEntry[], index: number): boolean 
 		&& (next.message.role === "user" || next.message.role === "assistant");
 }
 
-function firstGoalEntryId(entries: SessionEntry[]): string | undefined {
-	return entries.find((entry) => entry.type === "message" && entry.message.role === "user")?.id;
-}
-
 /** Collect complete reference entries and block cards without including the target.
  * The protected tail stays eligible as background; only the request budget shrinks it. */
 function collectReferenceParts(
@@ -176,55 +187,45 @@ function collectReferenceParts(
 	const positions = new Map(entries.map((entry, index) => [entry.id, index] as const));
 	const visiblePositions = new Map(visibleEntries.map((entry, index) => [entry.id, index] as const));
 	const topBlocks = activeTopBlocks(entries, state);
-	const byFirstSource = new Map(topBlocks.map((block) => [block.sourceEntryIds[0], block] as const));
-	const occupied = new Set(topBlocks.flatMap((block) => block.sourceEntryIds));
-	const goalId = sessionGoalId(deps);
+	const byFirstSource = new Map(topBlocks.map((block) => [block.startEntryId, block] as const));
+	const occupied = occupiedSourceIds(entries, state);
 	const parts: ReferencePart[] = [];
 
-	const add = (text: string, order: number, priority: number, rank: number): void => {
-		if (text.trim()) parts.push({ text, order, priority, rank });
+	const add = (text: string, region: "above" | "below", order: number, priority: number, rank: number): void => {
+		if (text.trim()) parts.push({ text, region, order, priority, rank });
 	};
 
 	for (const entry of visibleEntries) {
-		if (entry.type === "compaction") {
-			add(cachedEntry(deps, entry).text, visiblePositions.get(entry.id) ?? 0, 0, 0);
-			continue;
-		}
+		if (entry.type === "compaction") continue;
 		const order = positions.get(entry.id) ?? visiblePositions.get(entry.id) ?? 0;
 		if (excludedSourceIds.has(entry.id)) continue;
 		const block = byFirstSource.get(entry.id);
 		if (block) {
-			if (!excludedBlockIds.has(block.blockId)) add(renderBlockCard(block), order, 1, order);
+			if (!excludedBlockIds.has(block.blockId)) add(renderBlockCard(block), "above", order, 1, order);
 			continue;
 		}
 		if (occupied.has(entry.id)) continue;
 
-		let priority = 3;
-		let rank = order;
-		if (entry.id === goalId) {
-			priority = 0;
-			rank = 0;
-		}
-		add(cachedEntry(deps, entry).text, order, priority, rank);
-	}
-
-	if (!entries.some((entry) => entry.id === goalId)) {
-		const hiddenGoal = deps.branchEntries.find((entry) => entry.id === goalId);
-		if (hiddenGoal) add(cachedEntry(deps, hiddenGoal).text, -1, 0, -1);
+		const priority = 3;
+		const rank = order;
+		add(cachedEntry(deps, entry).text, "below", order, priority, rank);
 	}
 
 	if (deps.referenceContext.trim()) {
-		add(deps.referenceContext, entries.length + 1, 0, 1);
+		add(deps.referenceContext, "below", entries.length + 1, 0, 1);
 	}
 	return parts;
 }
 
-/** Join selected reference fragments back into their original source order. */
-function joinReferenceParts(parts: ReferencePart[]): string {
-	return [...parts]
+/** Join selected reference fragments back into their original source order per region. */
+function joinReferenceParts(parts: ReferencePart[]): { above: string; below: string } {
+	const byRegion = { above: [] as ReferencePart[], below: [] as ReferencePart[] };
+	for (const part of parts) byRegion[part.region].push(part);
+	const join = (list: ReferencePart[]): string => [...list]
 		.sort((left, right) => left.order - right.order)
 		.map((part) => part.text)
 		.join("\n\n");
+	return { above: join(byRegion.above), below: join(byRegion.below) };
 }
 
 /** Keep reference context within the request budget at complete entry/card boundaries. */
@@ -233,24 +234,23 @@ function fitReferenceContext(
 	state: PluginState,
 	excludedSourceIds: Set<string>,
 	excludedBlockIds: Set<string>,
-	makeInput: (referenceContext: string) => SummarizeInput,
+	makeInput: (referenceAbove: string, referenceBelow: string) => SummarizeInput,
 	boundReference = true,
-): { text: string; fits: boolean } {
+): { above: string; below: string; fits: boolean } {
 	const parts = collectReferenceParts(deps, state, excludedSourceIds, excludedBlockIds);
 	const complete = joinReferenceParts(parts);
 	if (!boundReference) {
-		return {
-			text: complete,
-			fits: summaryRequestTokens(deps, makeInput(complete)) <= deps.contextWindow,
-		};
+		const input = makeInput(complete.above, complete.below);
+		return { ...complete, fits: summaryRequestTokens(deps, input) <= deps.contextWindow };
 	}
-	if (summaryRequestTokens(deps, makeInput(complete)) <= deps.contextWindow) {
-		return { text: complete, fits: true };
+	const completeInput = makeInput(complete.above, complete.below);
+	if (summaryRequestTokens(deps, completeInput) <= deps.contextWindow) {
+		return { ...complete, fits: true };
 	}
 
-	const empty = makeInput("");
+	const empty = makeInput("", "");
 	const emptyTokens = summaryRequestTokens(deps, empty);
-	if (emptyTokens > deps.contextWindow) return { text: "", fits: false };
+	if (emptyTokens > deps.contextWindow) return { above: "", below: "", fits: false };
 
 	const available = deps.contextWindow - emptyTokens;
 	const ranked = [...parts].sort((left, right) =>
@@ -265,26 +265,29 @@ function fitReferenceContext(
 		selectedTokens += partTokens;
 	}
 
-	let text = joinReferenceParts(selected);
-	while (selected.length > 0 && summaryRequestTokens(deps, makeInput(text)) > deps.contextWindow) {
+	let joined = joinReferenceParts(selected);
+	while (selected.length > 0 && summaryRequestTokens(deps, makeInput(joined.above, joined.below)) > deps.contextWindow) {
 		selected.pop();
-		text = joinReferenceParts(selected);
+		joined = joinReferenceParts(selected);
 	}
-	return { text, fits: summaryRequestTokens(deps, makeInput(text)) <= deps.contextWindow };
+	const input = makeInput(joined.above, joined.below);
+	return { ...joined, fits: summaryRequestTokens(deps, input) <= deps.contextWindow };
 }
 
 /** Build a summary input and bound only its non-target reference context. */
 function prepareInput(
 	deps: CompressDeps,
 	state: PluginState,
-	base: Omit<SummarizeInput, "referenceContext">,
+	base: Omit<SummarizeInput, "systemPrompt" | "referenceAbove" | "referenceBelow">,
 	excludedSourceIds: Set<string>,
 	excludedBlockIds: Set<string>,
 	boundReference = true,
 ): PreparedInput {
-	const makeInput = (referenceContext: string): SummarizeInput => ({ ...base, referenceContext });
+	const makeInput = (referenceAbove: string, referenceBelow: string): SummarizeInput => ({
+		...base, systemPrompt: deps.systemPrompt, referenceAbove, referenceBelow,
+	});
 	const reference = fitReferenceContext(deps, state, excludedSourceIds, excludedBlockIds, makeInput, boundReference);
-	return { input: makeInput(reference.text), fits: reference.fits };
+	return { input: makeInput(reference.above, reference.below), fits: reference.fits };
 }
 
 
@@ -293,12 +296,14 @@ async function summarizeBlock(
 	state: PluginState,
 	input: SummarizeInput,
 ): Promise<{ block?: CompactBlock; error?: string }> {
+	throwIfAborted(deps);
 	const prompt = buildSummarizePrompt(input);
 	const firstRequestTokens = summaryRequestTokensForPrompt(deps, prompt, input.budgetTokens);
 	if (firstRequestTokens > deps.contextWindow) {
 		return { error: `summary request needs about ${firstRequestTokens} tokens, window is ${deps.contextWindow}` };
 	}
 	let response = (await deps.summarizeFn(prompt)).trim();
+	throwIfAborted(deps);
 	let parsed = parseSummaryResponse(response);
 	let cardTokens = cardTokensFor(state.nextSeq, input, parsed.summary, deps.estimate);
 	let validation = validateSummary(parsed.summary, cardTokens, input.budgetTokens);
@@ -310,6 +315,7 @@ async function summarizeBlock(
 			return { error: `summary rewrite needs about ${rewriteRequestTokens} tokens, window is ${deps.contextWindow}` };
 		}
 		response = (await deps.summarizeFn(rewritePrompt)).trim();
+		throwIfAborted(deps);
 		parsed = parseSummaryResponse(response);
 		cardTokens = cardTokensFor(state.nextSeq, input, parsed.summary, deps.estimate);
 		validation = validateSummary(parsed.summary, cardTokens, input.budgetTokens);
@@ -321,7 +327,8 @@ async function summarizeBlock(
 			blockId: nextBlockId(state.nextSeq),
 			level: input.level,
 			overview: parsed.overview,
-			sourceEntryIds: [...input.sourceEntryIds],
+			startEntryId: input.sourceEntryIds[0] ?? "",
+			endEntryId: input.sourceEntryIds.at(-1) ?? "",
 			childBlockIds: [...input.childBlockIds],
 			summary: parsed.summary,
 			createdAt: new Date().toISOString(),
@@ -336,8 +343,8 @@ function addTopBlock(state: PluginState, block: CompactBlock, positions: Map<str
 	const top = [...state.topLevelBlockIds, block.blockId].sort((left, right) => {
 		const a = left === block.blockId ? block : byId.get(left);
 		const b = right === block.blockId ? block : byId.get(right);
-		return (positions.get(a?.sourceEntryIds[0] ?? "") ?? Number.MAX_SAFE_INTEGER)
-			- (positions.get(b?.sourceEntryIds[0] ?? "") ?? Number.MAX_SAFE_INTEGER);
+		return (positions.get(a?.startEntryId ?? "") ?? Number.MAX_SAFE_INTEGER)
+			- (positions.get(b?.startEntryId ?? "") ?? Number.MAX_SAFE_INTEGER);
 	});
 	return {
 		...state,
@@ -391,13 +398,6 @@ function validateMergeGroup(
 	if (requireSameLevel && concrete.some((block) => block.level !== concrete[0].level)) {
 		return "blocks must have the same level";
 	}
-	const entries = sourceEntries(deps);
-	const positions = new Map(entries.map((entry, index) => [entry.id, index] as const));
-	for (let i = 1; i < concrete.length; i++) {
-		const previous = positions.get(concrete[i - 1].sourceEntryIds.at(-1) ?? "");
-		const current = positions.get(concrete[i].sourceEntryIds[0]);
-		if (previous === undefined || current !== previous + 1) return "blocks must cover contiguous source entries";
-	}
 	return concrete;
 }
 
@@ -422,9 +422,9 @@ async function promoteGroup(
 		return { state: replaceTopGroup(state, groupIds, reusable, false), block: reusable, created: false };
 	}
 
-	const sourceEntryIds = checked.flatMap((block) => block.sourceEntryIds);
+	const sourceEntryIds = [checked[0].startEntryId, checked.at(-1)?.endEntryId ?? checked[0].endEntryId];
 	const sourceTokens = checked.reduce((sum, block) => sum + block.sourceTokens, 0);
-	const base: Omit<SummarizeInput, "referenceContext"> = {
+	const base: Omit<SummarizeInput, "systemPrompt" | "referenceAbove" | "referenceBelow"> = {
 		targetRange: checked.map((block) => `[${block.blockId} level ${block.level}]\n${block.summary}`).join("\n\n"),
 		sourceEntryIds,
 		sourceTokens,
@@ -453,9 +453,8 @@ interface SameLevelRun {
 	level: number;
 }
 
-function sameLevelRuns(state: PluginState, entries: SessionEntry[]): SameLevelRun[] {
+function sameLevelRuns(state: PluginState, _entries: SessionEntry[]): SameLevelRun[] {
 	const byId = new Map(state.blocks.map((block) => [block.blockId, block] as const));
-	const positions = new Map(entries.map((entry, index) => [entry.id, index] as const));
 	const runs: SameLevelRun[] = [];
 	let start = 0;
 	while (start < state.topLevelBlockIds.length) {
@@ -463,13 +462,9 @@ function sameLevelRuns(state: PluginState, entries: SessionEntry[]): SameLevelRu
 		if (!firstBlock) break;
 		const level = firstBlock.level;
 		let end = start + 1;
-		let previous = firstBlock;
 		while (end < state.topLevelBlockIds.length) {
 			const current = byId.get(state.topLevelBlockIds[end]);
-			const previousEnd = positions.get(previous.sourceEntryIds.at(-1) ?? "");
-			const currentStart = positions.get(current?.sourceEntryIds[0] ?? "");
-			if (!current || current.level !== level || previousEnd === undefined || currentStart !== previousEnd + 1) break;
-			previous = current;
+			if (!current || current.level !== level) break;
 			end++;
 		}
 		runs.push({ start, level, ids: state.topLevelBlockIds.slice(start, end) });
@@ -489,6 +484,7 @@ async function stabilize(
 	const k = deps.cfg.blockMergeThreshold;
 	if (k < 2) return { blocks: [], error: "blockMergeThreshold must be at least 2" };
 	for (;;) {
+		throwIfAborted(deps);
 		const automatic = sameLevelRuns(state, sourceEntries(deps)).find((run) => run.ids.length >= k + 1);
 		if (automatic) {
 			const promoted = await promoteGroup(deps, state, automatic.ids.slice(0, k), undefined, boundReference);
@@ -510,20 +506,11 @@ async function stabilize(
 			continue;
 		}
 
-		// Mixed-level, source-contiguous neighbors can share a parent without a unary node.
-		const entries = sourceEntries(deps);
-		const positions = new Map(entries.map((entry, index) => [entry.id, index] as const));
+		// Mixed-level neighbors can share a parent; any messages later inserted
+		// between their stable boundaries are deliberately absorbed by that parent.
 		let pressureIds: string[] | undefined;
 		for (let start = 0; start < state.topLevelBlockIds.length - 1 && !pressureIds; start++) {
-			const ids = [state.topLevelBlockIds[start]];
-			for (let end = start + 1; end < state.topLevelBlockIds.length && ids.length < k; end++) {
-				const previous = state.blocks.find((block) => block.blockId === ids.at(-1));
-				const current = state.blocks.find((block) => block.blockId === state.topLevelBlockIds[end]);
-				const previousEnd = positions.get(previous?.sourceEntryIds.at(-1) ?? "");
-				const currentStart = positions.get(current?.sourceEntryIds[0] ?? "");
-				if (!previous || !current || previousEnd === undefined || currentStart !== previousEnd + 1) break;
-				ids.push(current.blockId);
-			}
+			const ids = state.topLevelBlockIds.slice(start, Math.min(start + k, state.topLevelBlockIds.length));
 			if (ids.length >= 2) pressureIds = ids;
 		}
 		if (!pressureIds) return { blocks: created, error: `cannot satisfy maxBlocks=${max.value}` };
@@ -535,7 +522,12 @@ async function stabilize(
 }
 
 function occupiedSourceIds(entries: SessionEntry[], state: PluginState): Set<string> {
-	return new Set(activeTopBlocks(entries, state).flatMap((block) => block.sourceEntryIds));
+	const positions = new Map(entries.map((entry, index) => [entry.id, index] as const));
+	const blocks = activeTopBlocks(entries, state);
+	const start = positions.get(blocks[0]?.startEntryId ?? "");
+	const end = positions.get(blocks.at(-1)?.endEntryId ?? "");
+	if (start === undefined || end === undefined || end < start) return new Set();
+	return new Set(entries.slice(start, end + 1).map((entry) => entry.id));
 }
 
 interface ScopedState {
@@ -639,11 +631,11 @@ function hasOrphanToolResult(entries: SessionEntry[], from: number, to: number):
 function nextUncompressedRun(
 	entries: SessionEntry[],
 	state: PluginState,
-	goalIndex: number,
+	startIndex: number,
 	protectedFrom: number,
 ): { from: number; to: number } | undefined {
 	const occupied = occupiedSourceIds(entries, state);
-	for (let from = Math.max(0, goalIndex + 1); from < protectedFrom; from++) {
+	for (let from = Math.max(0, startIndex); from < protectedFrom; from++) {
 		if (occupied.has(entries[from].id)) continue;
 		let to = from;
 		while (to + 1 < protectedFrom && !occupied.has(entries[to + 1].id)) to++;
@@ -656,11 +648,11 @@ function nextUncompressedRun(
 function hasUncompressedSource(
 	entries: SessionEntry[],
 	state: PluginState,
-	goalIndex: number,
+	startIndex: number,
 	protectedFrom: number,
 ): boolean {
 	const occupied = occupiedSourceIds(entries, state);
-	for (let i = Math.max(0, goalIndex + 1); i < protectedFrom; i++) {
+	for (let i = Math.max(0, startIndex); i < protectedFrom; i++) {
 		if (!occupied.has(entries[i].id)) return true;
 	}
 	return false;
@@ -707,6 +699,13 @@ function findAutoCandidate(
 	}
 	if (boundaries.length === 0) return { boundaries: 0 };
 
+	// The reference regions must be disjoint from the target domain: every entry of
+	// the run being compressed belongs to the content about to be compacted, so
+	// none of it may appear as background. Excluding only the current candidate
+	// leaks the not-yet-compressed segments into the reference, duplicates them,
+	// and squeezes the target budget below the card structure cost.
+	const runSourceIds = new Set(entries.slice(run.from, run.to + 1).map((entry) => entry.id));
+
 	// Walk backward from the end of the oldest raw run. The request budget is
 	// checked against the actual target, references, and summary output reserve;
 	// an arbitrary half-window target cap breaks the sliding reconstruction pass.
@@ -716,19 +715,19 @@ function findAutoCandidate(
 		const targetEntries = entries.slice(run.from, end + 1);
 		const sourceEntryIds = targetEntries.map((entry) => entry.id);
 		const sourceTokens = rangeTokens(index, run.from, end);
-		const base: Omit<SummarizeInput, "referenceContext"> = {
+		const base: Omit<SummarizeInput, "systemPrompt" | "referenceAbove" | "referenceBelow"> = {
 			targetRange: serializeRangeCached(deps, targetEntries),
 			sourceEntryIds,
 			sourceTokens,
 			level: 1,
 			childBlockIds: [],
-			budgetTokens: deps.cfg.blockTokenCeiling,
+			budgetTokens: levelOneBudget(deps, sourceTokens),
 		};
 		const prepared = prepareInput(
 			deps,
 			state,
 			base,
-			new Set(sourceEntryIds),
+			runSourceIds,
 			new Set(),
 			true,
 		);
@@ -738,6 +737,11 @@ function findAutoCandidate(
 		if (prepared.fits) return { candidate: { from: run.from, to: end, input: prepared.input }, boundaries: boundaries.length, smallestTargetTokens, minimumRequestTokens };
 	}
 	return { boundaries: boundaries.length, smallestTargetTokens, minimumRequestTokens };
+}
+
+/** Limit a level-1 card by both the configured ceiling and the required net gain. */
+function levelOneBudget(deps: CompressDeps, sourceTokens: number): number {
+	return Math.max(1, Math.min(deps.cfg.blockTokenCeiling, sourceTokens - deps.cfg.minNetGainTokens));
 }
 
 async function createLevelOne(
@@ -754,13 +758,13 @@ async function createLevelOne(
 	const entries = source.slice(from, to + 1);
 	const sourceEntryIds = entries.map((entry) => entry.id);
 	const sourceTokens = rangeTokens(index, from, to);
-	const base: Omit<SummarizeInput, "referenceContext"> = {
+	const base: Omit<SummarizeInput, "systemPrompt" | "referenceAbove" | "referenceBelow"> = {
 		targetRange: serializeRangeCached(deps, entries),
 		sourceEntryIds,
 		sourceTokens,
 		level: 1,
 		childBlockIds: [],
-		budgetTokens: deps.cfg.blockTokenCeiling,
+		budgetTokens: levelOneBudget(deps, sourceTokens),
 		focus,
 	};
 	const prepared = preparedInput
@@ -798,7 +802,10 @@ function reportProgress(
 
 /** Net-gain gate shared by automatic and manual compression; splits are exempt. */
 function netGainError(deps: CompressDeps, sourceTokens: number, cardTokens: number): string | undefined {
-	return sourceTokens - cardTokens < deps.cfg.minNetGainTokens ? "estimated net gain is too small" : undefined;
+	const netGain = sourceTokens - cardTokens;
+	return netGain < deps.cfg.minNetGainTokens
+		? `estimated net gain is too small (source ${sourceTokens}, card ${cardTokens}, net ${netGain}, minimum ${deps.cfg.minNetGainTokens} tokens)`
+		: undefined;
 }
 
 /** Automatically normalize every complete uncompressed range before the protected suffix. */
@@ -813,8 +820,7 @@ export async function runAutoCompression(deps: CompressDeps, inputState: PluginS
 	const protectedFrom = protectedStart(index, entries, keep);
 	const protectedEntry = entries[protectedFrom];
 	const protectedMessage = protectedEntry?.type === "message" ? protectedEntry.message : undefined;
-	const goalId = sessionGoalId(deps);
-	const goalIndex = goalId ? index.positions.get(goalId) ?? -1 : -1;
+	const compressionStart = firstCompressibleIndex(entries);
 	let working = scoped.state;
 	const initiallyOccupied = occupiedSourceIds(entries, working);
 	let protectedIncompleteTail = false;
@@ -825,7 +831,7 @@ export async function runAutoCompression(deps: CompressDeps, inputState: PluginS
 	const createdBlocks: CompactBlock[] = [];
 	let totalTokens = 0;
 	let compressedTokens = 0;
-	for (let position = Math.max(0, goalIndex + 1); position < adjustedProtectedFrom; position++) {
+	for (let position = compressionStart; position < adjustedProtectedFrom; position++) {
 		const tokens = index.tokens[position] ?? 0;
 		totalTokens += tokens;
 		if (initiallyOccupied.has(entries[position].id)) compressedTokens += tokens;
@@ -840,7 +846,8 @@ export async function runAutoCompression(deps: CompressDeps, inputState: PluginS
 	if (initialStable.blocks.length > 0) reportProgress(deps, compressedTokens, totalTokens, initialStable.blocks);
 
 	for (;;) {
-		const run = nextUncompressedRun(entries, working, goalIndex, adjustedProtectedFrom);
+		throwIfAborted(deps);
+		const run = nextUncompressedRun(entries, working, compressionStart, adjustedProtectedFrom);
 		if (!run) break;
 		const search = findAutoCandidate(deps, working, entries, index, run);
 		if (!search.candidate) {
@@ -883,7 +890,7 @@ export async function runAutoCompression(deps: CompressDeps, inputState: PluginS
 		if (stable.blocks.length > 0) reportProgress(deps, compressedTokens, totalTokens, stable.blocks);
 	}
 
-	if (hasUncompressedSource(entries, working, goalIndex, adjustedProtectedFrom) && !protectedIncompleteTail) {
+	if (hasUncompressedSource(entries, working, compressionStart, adjustedProtectedFrom) && !protectedIncompleteTail) {
 		return { status: "error", reason: "uncompressed content remains before the protected suffix", createdBlocks };
 	}
 	if (createdBlocks.length === 0) {
@@ -915,11 +922,8 @@ export async function runManualCompression(
 	const start = positions.get(startId);
 	let end = positions.get(endId);
 	if (start === undefined || end === undefined || end < start) return { status: "error", reason: "invalid source range" };
-	const goalId = sessionGoalId(deps);
-	const goalIndex = goalId ? positions.get(goalId) ?? -1 : -1;
 	while (end < source.length - 1 && !isTurnBoundary(source, end)) end++;
 	const requestedEnd = end;
-	if (start <= goalIndex && goalIndex <= end) return { status: "error", reason: "the session goal entry must remain uncompressed" };
 	if (end >= source.length - 1) return { status: "error", reason: "the current incomplete tail cannot be compressed" };
 	if (hasOrphanToolResult(source, start, end)) return { status: "error", reason: "the source range contains an orphan tool result" };
 	const occupied = occupiedSourceIds(source, state);
@@ -1037,14 +1041,6 @@ export async function runTreeMerge(
 	const parent = parentId === undefined ? undefined : state.blocks.find((block) => block.blockId === parentId);
 	if (parentId !== undefined && (!parent || concrete[0].level + 1 >= parent.level)) {
 		return { status: "error", reason: "merged block must remain below its parent level" };
-	}
-	const positions = new Map(source.map((entry, index) => [entry.id, index] as const));
-	for (let index = 1; index < concrete.length; index++) {
-		const previous = positions.get(concrete[index - 1].sourceEntryIds.at(-1) ?? "");
-		const current = positions.get(concrete[index].sourceEntryIds[0]);
-		if (previous === undefined || current !== previous + 1) {
-			return { status: "error", reason: "blocks must cover contiguous source entries" };
-		}
 	}
 	const leaves = blockIds.flatMap((id) => leafBlockIds(state, id));
 	if (parentId !== undefined) {
