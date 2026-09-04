@@ -17,13 +17,21 @@ import {
 	runAutoCompression,
 	runTreeMerge,
 	runTreeSplit,
+	isCompressionAborted,
 	type CompressDeps,
 	type CompressOutcome,
 	type CompressProgress,
 } from "./compress.ts";
 import { defaultConfig, loadConfig, resolveTokenLimit, saveConfig, type AutoCompactConfig } from "./config.ts";
 import { makeContextGetTool } from "./contextGet.ts";
-import { activeChildFrontier, activeTopBlocks, buildMapping, projectMessages, projectSessionEntries } from "./mapping.ts";
+import {
+	activeChildFrontier,
+	activeTopBlocks,
+	buildMapping,
+	projectMessages,
+	projectSessionEntries,
+	unmatchedMessagesOutsideBlocks,
+} from "./mapping.ts";
 import { loadState, saveState, statePathFor } from "./state.ts";
 import { SUMMARIZER_SYSTEM_PROMPT } from "./summarizer.ts";
 import { freshState, type PluginState } from "./types.ts";
@@ -50,6 +58,13 @@ export default function autoCompactExtension(pi: ExtensionAPI) {
 	let footer: { requestRender(): void; dispose(): void } | undefined;
 	let renderFooter = (): void => {};
 	let lastCompressionProgress: CompressProgress | undefined;
+	interface ActiveCompression {
+		controller: AbortController;
+		cleanup: () => void;
+	}
+	let activeCompression: ActiveCompression | undefined;
+	let shuttingDown = false;
+	let inputGuardUnsubscribe: (() => void) | undefined;
 
 	function debugLog(message: string, details?: unknown): void {
 		if (!cfg.debug) return;
@@ -118,7 +133,10 @@ export default function autoCompactExtension(pi: ExtensionAPI) {
 		const branchEntries = ctx.sessionManager.getBranch();
 		const branchIds = new Set(branchEntries.map((entry) => entry.id));
 		const parentById = new Map(parent.blocks.map((block) => [block.blockId, block] as const));
-		const valid = (blockId: string) => parentById.get(blockId)?.sourceEntryIds.every((id) => branchIds.has(id)) ?? false;
+		const valid = (blockId: string) => {
+			const block = parentById.get(blockId);
+			return block ? branchIds.has(block.startEntryId) && branchIds.has(block.endEntryId) : false;
+		};
 		const parentFrontiers = parent.topLevelBlockIdsByBranch ?? { __root__: parent.topLevelBlockIds };
 		const childFrontierAt = (key: string): Record<string, string[]> => {
 			if (key === "__root__") return activeChildFrontier([], parent);
@@ -142,7 +160,7 @@ export default function autoCompactExtension(pi: ExtensionAPI) {
 			}
 		}
 		const topLevelBlockIds = seedFrontier.flatMap((id) => descend(id, childFrontierAt(seedKey)));
-		const blocks = parent.blocks.filter((block) => block.sourceEntryIds.every((id) => branchIds.has(id)));
+		const blocks = parent.blocks.filter((block) => branchIds.has(block.startEntryId) && branchIds.has(block.endEntryId));
 		const topLevelBlockIdsByBranch: Record<string, string[]> = {};
 		for (const [key, ids] of Object.entries(parentFrontiers)) {
 			if (key !== "__root__" && !branchIds.has(key)) continue;
@@ -167,7 +185,7 @@ export default function autoCompactExtension(pi: ExtensionAPI) {
 		const childBlockIdsByParent = filterChildren(activeChildFrontier(branchEntries, parent));
 		childBlockIdsByParentByBranch[leafId] = childBlockIdsByParent;
 		const inherited: PluginState = {
-			schemaVersion: 3,
+			schemaVersion: 4,
 			blocks,
 			topLevelBlockIds,
 			childBlockIdsByParent,
@@ -269,11 +287,32 @@ export default function autoCompactExtension(pi: ExtensionAPI) {
 		});
 	}
 
-	/** Serialize all state-changing operations; rejected work does not poison the queue. */
-	function runExclusive<T>(operation: () => Promise<T>): Promise<T> {
-		const result = queue.then(operation, operation);
+	/** Combine several abort sources so any one of them cancels the operation. */
+	function mergedSignal(...signals: Array<AbortSignal | undefined>): AbortSignal | undefined {
+		const present = signals.filter((item): item is AbortSignal => item !== undefined);
+		if (present.length === 0) return undefined;
+		return present.length === 1 ? present[0] : AbortSignal.any(present);
+	}
+
+	/** Serialize state-changing operations; each gets its own abort controller so
+	 * session shutdown and session-interrupt events can cancel an in-flight summary. */
+	function runExclusive<T>(operation: (signal: AbortSignal) => Promise<T>, externalSignal?: AbortSignal): Promise<T> {
+		const controller = new AbortController();
+		const record: ActiveCompression = {
+			controller,
+			cleanup: () => {
+				if (activeCompression === record) activeCompression = undefined;
+			},
+		};
+		const signal = mergedSignal(controller.signal, externalSignal) ?? controller.signal;
+		const run = (): Promise<T> => {
+			if (shuttingDown || controller.signal.aborted) throw new Error("compression aborted");
+			activeCompression = record;
+			return operation(signal);
+		};
+		const result = queue.then(run, run);
 		queue = result.then(() => undefined, () => undefined);
-		return result;
+		return result.finally(() => record.cleanup());
 	}
 
 	function makeSummarizeFn(ctx: ExtensionContext, signal: AbortSignal | undefined = ctx.signal): ((prompt: string) => Promise<string>) | null {
@@ -322,11 +361,11 @@ export default function autoCompactExtension(pi: ExtensionAPI) {
 			sessionKey: currentSessionKey(ctx),
 			branchEntries,
 			contextEntries,
-			goalEntryId: branchEntries.find((entry) => entry.type === "message" && entry.message.role === "user")?.id,
 			contextWindow,
 			referenceContext: additionalMessages
 				.map((message, index) => `[visible message ${index} ${message.role}]\n${messageToText(message, true)}`)
 				.join("\n\n"),
+			systemPrompt: ctx.getSystemPrompt(),
 			estimate: estimateTokens,
 			onProgress: (progress) => updateCompression(ctx, progress),
 			summarizeFn,
@@ -342,24 +381,43 @@ export default function autoCompactExtension(pi: ExtensionAPI) {
 		contextEntries?: SessionEntry[],
 		expectedSessionKey?: string,
 	): Promise<CompressOutcome> {
-		return runExclusive(async () => {
-			beginCompression(ctx);
-			if (expectedSessionKey !== undefined && currentSessionKey(ctx) !== expectedSessionKey) {
-				const outcome = { status: "skipped" as const, reason: "Session changed before compression started; discarded the stale request." };
+		try {
+			return await runExclusive(async (operationSignal) => {
+				beginCompression(ctx);
+				if (expectedSessionKey !== undefined && currentSessionKey(ctx) !== expectedSessionKey) {
+					const outcome = { status: "skipped" as const, reason: "Session changed before compression started; discarded the stale request." };
+					finishCompression(ctx, outcome);
+					return outcome;
+				}
+				const deps = buildCompressDeps(ctx, additionalMessages, branchEntries, operationSignal, contextEntries);
+				if (!deps) {
+					const outcome = { status: "error" as const, reason: "No active model or context window is available." };
+					finishCompression(ctx, outcome);
+					return outcome;
+				}
+				try {
+					const outcome = await runAutoCompression(deps, state);
+					if (outcome.state) commitState(outcome.state, ctx, deps.sessionKey);
+					finishCompression(ctx, outcome);
+					return outcome;
+				} catch (error) {
+					if (isCompressionAborted(error, deps.signal)) {
+						const outcome = { status: "skipped" as const, reason: "压缩已中断，未提交部分结果。" };
+						finishCompression(ctx, outcome);
+						return outcome;
+					}
+					throw error;
+				}
+			}, signal);
+		} catch (error) {
+			if (isCompressionAborted(error)) {
+				const outcome = { status: "skipped" as const, reason: "压缩已中断，未提交部分结果。" };
 				finishCompression(ctx, outcome);
 				return outcome;
 			}
-			const deps = buildCompressDeps(ctx, additionalMessages, branchEntries, signal, contextEntries);
-			if (!deps) {
-				const outcome = { status: "error" as const, reason: "No active model or context window is available." };
-				finishCompression(ctx, outcome);
-				return outcome;
-			}
-			const outcome = await runAutoCompression(deps, state);
-			if (outcome.state) commitState(outcome.state, ctx, deps.sessionKey);
-			finishCompression(ctx, outcome);
-			return outcome;
-		});
+			failCompression(ctx, error);
+			throw error;
+		}
 	}
 
 	function reloadConfig(ctx: ExtensionContext): void {
@@ -416,33 +474,45 @@ export default function autoCompactExtension(pi: ExtensionAPI) {
 				});
 				const selectedIds = await choiceForm(ctx, "选择要合并的连续同级兄弟块", choices, (items) => items.filter((item) => item.selected).map((item) => item.id));
 				if (!selectedIds?.length) return;
-				await runExclusive(async () => {
+				await runExclusive(async (operationSignal) => {
 					beginCompression(ctx);
-					const deps = buildCompressDeps(ctx);
+					const deps = buildCompressDeps(ctx, [], undefined, operationSignal);
 					if (!deps) throw new Error("没有可用的模型或上下文窗口");
-					const outcome = await runTreeMerge(deps, state, selected.parentId, selectedIds);
-					if (!outcome.state) throw new Error(outcome.reason);
-					commitState(outcome.state, ctx, deps.sessionKey);
-					finishCompression(ctx, outcome);
-				}).catch((error) => {
-					failCompression(ctx, error);
-					throw error;
-				});
+					try {
+						const outcome = await runTreeMerge(deps, state, selected.parentId, selectedIds);
+						if (!outcome.state) throw new Error(outcome.reason);
+						commitState(outcome.state, ctx, deps.sessionKey);
+						finishCompression(ctx, outcome);
+					} catch (error) {
+						if (isCompressionAborted(error, operationSignal)) {
+							finishCompression(ctx, { status: "skipped", reason: "压缩已中断" });
+							return;
+						}
+						failCompression(ctx, error);
+						throw error;
+					}
+				}, ctx.signal);
 				ctx.ui.notify(`已合并 ${selectedIds.join(", ")}`, "info");
 				return;
 			}
-			await runExclusive(async () => {
+			await runExclusive(async (operationSignal) => {
 				beginCompression(ctx);
-				const deps = buildCompressDeps(ctx);
+				const deps = buildCompressDeps(ctx, [], undefined, operationSignal);
 				if (!deps) throw new Error("没有可用的模型或上下文窗口");
-				const outcome = await runTreeSplit(deps, state, selected.parentId, block.blockId);
-				if (!outcome.state) throw new Error(outcome.reason);
-				commitState(outcome.state, ctx, deps.sessionKey);
-				finishCompression(ctx, outcome);
-			}).catch((error) => {
-				failCompression(ctx, error);
-				throw error;
-			});
+				try {
+					const outcome = await runTreeSplit(deps, state, selected.parentId, block.blockId);
+					if (!outcome.state) throw new Error(outcome.reason);
+					commitState(outcome.state, ctx, deps.sessionKey);
+					finishCompression(ctx, outcome);
+				} catch (error) {
+					if (isCompressionAborted(error, operationSignal)) {
+						finishCompression(ctx, { status: "skipped", reason: "压缩已中断" });
+						return;
+					}
+					failCompression(ctx, error);
+					throw error;
+				}
+			}, ctx.signal);
 			ctx.ui.notify(`已拆分 ${block.blockId}`, "info");
 		},
 	});
@@ -497,23 +567,18 @@ export default function autoCompactExtension(pi: ExtensionAPI) {
 			if (ctx.hasUI) ctx.ui.notify("Pi 原生 /compact 已禁用；请使用 /auto-compact 或 compact_context。", "warning");
 			return { cancel: true };
 		}
+		// 插件始终接管 threshold/overflow 压缩；即使失败也取消原生行为，不回退原生 compact。
 		try {
 			const operationKey = currentSessionKey(ctx);
 			const outcome = await executeAutoCompression(ctx, event.branchEntries, event.signal, [], ctx.sessionManager.buildContextEntries(), operationKey);
 			if (outcome.status === "error" && ctx.hasUI) {
-				ctx.ui.notify(
-					`auto-compact: ${outcome.reason ?? "压缩失败"}${outcome.state ? "，原生压缩已取消" : "，交由原生压缩处理"}`,
-					outcome.state ? "error" : "warning",
-				);
+				ctx.ui.notify(`auto-compact: ${outcome.reason ?? "压缩失败"}，旧上下文保持不变`, "error");
 			}
-			// 仅当窗口已溢出且插件没有任何产出时，才放行原生压缩作为兑底。
-			if (event.reason === "overflow" && !outcome.state) return;
 		} catch (error) {
 			failCompression(ctx, error);
 			if (ctx.hasUI) {
-				ctx.ui.notify(`auto-compact: ${error instanceof Error ? error.message : String(error)}，交由原生压缩处理`, "error");
+				ctx.ui.notify(`auto-compact: ${error instanceof Error ? error.message : String(error)}，旧上下文保持不变`, "error");
 			}
-			if (event.reason === "overflow") return;
 		}
 		return { cancel: true };
 	});
@@ -524,6 +589,44 @@ export default function autoCompactExtension(pi: ExtensionAPI) {
 		refreshProjectedUsage(ctx);
 	});
 
+	/** While a compression is running, consume the Enter that would submit /reload. */
+	function installReloadGuard(ctx: ExtensionContext): void {
+		inputGuardUnsubscribe?.();
+		inputGuardUnsubscribe = undefined;
+		if (!ctx.hasUI) return;
+		inputGuardUnsubscribe = ctx.ui.onTerminalInput((data) => {
+			if (!activeCompression) return undefined;
+			if (!/[\r\n]/.test(data)) return undefined;
+			if (ctx.ui.getEditorText().trim() !== "/reload") return undefined;
+			ctx.ui.notify("压缩进行中，已取消 /reload。", "warning");
+			return { consume: true };
+		});
+	}
+
+	pi.on("session_before_tree", (_event, ctx) => {
+		if (activeCompression) {
+			activeCompression.controller.abort();
+			if (ctx.hasUI) ctx.ui.notify("压缩进行中，已取消 tree 导航。", "warning");
+			return { cancel: true };
+		}
+	});
+
+	pi.on("session_before_fork", (_event, ctx) => {
+		if (activeCompression) {
+			activeCompression.controller.abort();
+			if (ctx.hasUI) ctx.ui.notify("压缩进行中，已取消 fork/clone。", "warning");
+			return { cancel: true };
+		}
+	});
+
+	pi.on("session_before_switch", (_event, ctx) => {
+		if (activeCompression) {
+			activeCompression.controller.abort();
+			if (ctx.hasUI) ctx.ui.notify("压缩进行中，已取消 new/resume。", "warning");
+			return { cancel: true };
+		}
+	});
+
 	pi.on("model_select", (_event, ctx) => {
 		contextOverhead = 0;
 		projectedUsage = undefined;
@@ -531,10 +634,12 @@ export default function autoCompactExtension(pi: ExtensionAPI) {
 	});
 
 	pi.on("session_start", (event, ctx) => {
+		shuttingDown = false;
 		ensureSession(ctx);
 		footer?.dispose();
 		footer = installAutoCompactFooter(ctx, () => projectedUsage);
 		renderFooter = () => footer?.requestRender();
+		installReloadGuard(ctx);
 		if (event.reason === "fork" && event.previousSessionFile) {
 			try {
 				inheritForkState(event.previousSessionFile, ctx);
@@ -551,7 +656,11 @@ export default function autoCompactExtension(pi: ExtensionAPI) {
 	});
 
 	// Footer 在 session_start 重新安装；会话退出时释放订阅，避免渲染回调引用旧实例。
-	pi.on("session_shutdown", () => {
+	pi.on("session_shutdown", (event) => {
+		shuttingDown = true;
+		activeCompression?.controller.abort();
+		inputGuardUnsubscribe?.();
+		inputGuardUnsubscribe = undefined;
 		footer?.dispose();
 		footer = undefined;
 	});
@@ -561,10 +670,15 @@ export default function autoCompactExtension(pi: ExtensionAPI) {
 		const visible = ctx.sessionManager.buildContextEntries();
 		const mapping = buildMapping(visible, event.messages);
 		const unmatched = mapping.messageEntryIds.filter((id) => id === null).length;
-		if (unmatched > 0) {
-			debugLog("context mapping left unmatched messages", { unmatched, total: event.messages.length });
-		}
 		const blocks = activeTopBlocks(visible, state);
+		const outsideInjected = unmatchedMessagesOutsideBlocks(event.messages, mapping, blocks);
+		if (unmatched > 0) {
+			debugLog("context mapping left unmatched messages", {
+				unmatched,
+				discardedInsideCompactEnvelope: unmatched - outsideInjected.length,
+				total: event.messages.length,
+			});
+		}
 		const projected = projectMessages(event.messages, mapping, blocks);
 		if (!cfg.enabled) return { messages: projected };
 		const usage = ctx.getContextUsage();
@@ -586,7 +700,7 @@ export default function autoCompactExtension(pi: ExtensionAPI) {
 		debugLog("context projected", { projectedTokens, trigger, window, messageCount: event.messages.length });
 		if (projectedTokens < trigger && projectedTokens < window) return { messages: projected };
 
-		const additionalMessages = event.messages.filter((_message, index) => mapping.messageEntryIds[index] === null);
+		const additionalMessages = outsideInjected;
 		const operationKey = currentSessionKey(ctx);
 		try {
 			const outcome = await executeAutoCompression(ctx, undefined, ctx.signal, additionalMessages, visible, operationKey);

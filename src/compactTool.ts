@@ -1,18 +1,25 @@
 /** Manual level-1 compaction tool. */
 
-import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
+import type { AgentMessage } from "@earendil-works/pi-agent-core";
+import type { ExtensionContext, SessionEntry } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
-import { runManualCompression, type CompressDeps } from "./compress.ts";
+import { isCompressionAborted, runManualCompression, type CompressDeps } from "./compress.ts";
 import type { PluginState } from "./types.ts";
 
 export interface CompactToolDeps {
 	getState: (ctx: ExtensionContext) => PluginState;
 	commitState: (state: PluginState, ctx: ExtensionContext, expectedSessionKey?: string) => void;
 	beginCompression: (ctx: ExtensionContext) => void;
-	buildCompressDeps: (ctx: ExtensionContext) => CompressDeps | null;
+	buildCompressDeps: (
+		ctx: ExtensionContext,
+		additionalMessages?: AgentMessage[],
+		branchEntries?: SessionEntry[],
+		signal?: AbortSignal,
+		contextEntries?: SessionEntry[],
+	) => CompressDeps | null;
 	finishCompression: (ctx: ExtensionContext, outcome: Awaited<ReturnType<typeof runManualCompression>>) => void;
 	failCompression: (ctx: ExtensionContext, error: unknown) => void;
-	runExclusive: <T>(operation: () => Promise<T>) => Promise<T>;
+	runExclusive: <T>(operation: (signal: AbortSignal) => Promise<T>, externalSignal?: AbortSignal) => Promise<T>;
 }
 
 export function makeCompactTool(deps: CompactToolDeps) {
@@ -31,14 +38,14 @@ export function makeCompactTool(deps: CompactToolDeps) {
 		async execute(
 			_toolCallId: string,
 			params: { startId: string; endId: string; focus?: string },
-			_signal: AbortSignal | undefined,
+			signal: AbortSignal | undefined,
 			_onUpdate: unknown,
 			ctx: ExtensionContext,
 		) {
-			return deps.runExclusive(async () => {
+			return deps.runExclusive(async (operationSignal) => {
 				try {
 					deps.beginCompression(ctx);
-					const operation = deps.buildCompressDeps(ctx);
+					const operation = deps.buildCompressDeps(ctx, [], undefined, operationSignal);
 					if (!operation) throw new Error("No active model or context window is available.");
 					const outcome = await runManualCompression(operation, deps.getState(ctx), params.startId, params.endId, params.focus);
 					if (!outcome.state) throw new Error(outcome.reason ?? "Compaction failed.");
@@ -46,10 +53,14 @@ export function makeCompactTool(deps: CompactToolDeps) {
 					deps.finishCompression(ctx, outcome);
 					return result(describe(outcome.createdBlocks ?? []));
 				} catch (error) {
+					if (isCompressionAborted(error, operationSignal)) {
+						deps.finishCompression(ctx, { status: "skipped", reason: "压缩已中断" });
+						return result("Compaction interrupted.");
+					}
 					deps.failCompression(ctx, error);
 					throw error;
 				}
-			});
+			}, signal);
 		},
 	};
 }
