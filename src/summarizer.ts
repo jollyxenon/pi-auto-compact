@@ -4,75 +4,112 @@ import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import type { SummarizeInput } from "./types.ts";
 import { nextBlockId, renderBlockCard, type TokenEstimator } from "./util.ts";
 
-export const REQUIRED_HEADINGS = [
-	"## Constraints & Preferences",
-	"## Progress",
-	"## Key Decisions",
-	"## Next Steps",
-	"## Critical Context",
+export const SUMMARIZER_SYSTEM_PROMPT =
+	"You are requested to compress the context of this session. Compress according to the format specifications provided below.";
+
+/** Structural tags the compaction body must contain, in this exact order. */
+export const REQUIRED_STRUCTURE_TAGS = [
+	"<progress>",
+	"<done>",
+	"<doing>",
+	"<todo>",
+	"</progress>",
+	"<blocked>",
+	"<decision>",
+	"<critical_content>",
+	"<read_files>",
+	"<modified_files>",
 ] as const;
 
-export const REQUIRED_PROGRESS_HEADINGS = ["### Done", "### In Progress", "### Blocked"] as const;
+/** One-sentence overview length limit used by the compaction protocol. */
+export const OVERVIEW_MAX_CHARS = 50;
 
-export const SUMMARIZER_SYSTEM_PROMPT =
-	"You compress agent history. Follow the requested Markdown structure and source boundary exactly.";
+export function buildSummarizePrompt(input: SummarizeInput): string {
+	return `# Context Compaction
 
-const STRUCTURE = `Return only this format. OVERVIEW must be one sentence on one line, followed by the exact Markdown structure.
+## Compaction Specifications
 
+- The reference context is ONLY used to understand the task situation and DOES NOT enter the generated compression block;
+- When compressing, ONLY summarize the affairs that occur in the target compaction range and DO NOT expand the compression range outward;
+- The compaction block structure MUST conform to the given format;
+- Overview is limited to one sentence, not exceeding ${OVERVIEW_MAX_CHARS} characters;
+- The compressed block output in the final format should not exceed ${input.budgetTokens} Token.
+
+## Compaction Block Structure
+
+The content you output should only have compaction blocks, starting from \`<overview>\` and ending at \`</modified_files>\`; STRICTLY follow the format specifications and DO NOT include ANY irrelevant content.
+
+\`\`\`compaction_structure
 <overview>
-A concrete one-sentence description of what this block summarizes.
+As a title display, a one sentence overview.
 </overview>
 
-## Constraints & Preferences
-- ...
+<progress>
+<done>
+Completed affairs in the target compaction range. List by points.
+</done>
+<doing>
+The last ongoing affair in the target compaction range. List by points.
+</doing>
+<todo>
+The affair that should be carried out after the end of the last ongoing affair in the target compaction range. List by points.
+</todo>
+</progress>
 
-## Progress
-### Done
-- [x] ...
-### In Progress
-- [ ] ...
-### Blocked
-- None
+<blocked>
+A affair that was intended to be executed but could not be executed within the target compaction range due to certain reasons. List by points.
+</blocked>
 
-## Key Decisions
-- **Decision**: rationale
+<decision>
+Decisions made on open problems during task execution within the target compaction range. List by points. Please indicate whether the decision-maker is the user or the assistant.
+</decision>
 
-## Next Steps
-1. ...
+<critical_content>
+The content that plays an important role in thinking and decision-making within the target compaction range. List by points.
+</critical_content>
 
-## Critical Context
-- ...
+<read_files>
+The file path read within the target compaction range. List by points.
+</read_files>
 
-<read-files>
-path or (none)
-</read-files>
+<modified_files>
+The file path for editing and writing within the target compaction range. List by points.
+</modified_files>
+\`\`\`
 
-<modified-files>
-path or (none)
-</modified-files>`;
+## Content that Needs to Be Compressed
 
-/** Reference context may explain terms but only target events may enter the summary. */
-export function buildSummarizePrompt(input: SummarizeInput): string {
-	return `${STRUCTURE}
+You have been given the visible content of the entire session, including system prompt words, historical compaction blocks, target compaction range, and uncompressed reserved areas.
 
-Hard rules:
-- REFERENCE_CONTEXT is read-only background.
-- Summarize only facts, actions, decisions, and progress present in TARGET_RANGE.
-- Never output a Goal heading or restate the overall goal.
-- OVERVIEW must describe only TARGET_RANGE in one concrete sentence, on one line, no longer than 200 characters.
-- The detailed summary must start immediately after </overview>.
-- Do not invent IDs, paths, commands, results, or decisions.
-- The complete visible block card must fit within ${input.budgetTokens} tokens.
-- Source entry IDs: ${input.sourceEntryIds.join(", ")}
-- Direct child block IDs: ${input.childBlockIds.join(", ") || "(none)"}
-- New block level: ${input.level}
-- Source size: ${input.sourceTokens} tokens.${input.focus ? `\n- Requested focus: ${input.focus}` : ""}
+The system prompt words and historical compaction blocks are referenced in the previous text, and the uncompressed reserved area is referenced in the following text. Context reference is ONLY used to understand the task situation and DOES NOT enter the generated compression block.
 
-===== REFERENCE_CONTEXT (READ ONLY) =====
-${input.referenceContext}
+You should only compress the target compaction range, which is the content enclosed by \`<target_compaction_range>\` and \`</target_compaction_range>\`.
 
-===== TARGET_RANGE (ONLY SOURCE TO SUMMARIZE) =====
-${input.targetRange}`;
+The visible content of the entire session is as follows:
+
+\`\`\`reference
+<reference_above>
+<system_prompt>
+${input.systemPrompt}
+</system_prompt>
+<history_compaction_blocks>
+${input.referenceAbove}
+</history_compaction_blocks>
+</reference_above>
+\`\`\`
+
+\`\`\`target
+<target_compaction_range>
+${input.targetRange}
+</target_compaction_range>
+\`\`\`
+
+\`\`\`reference
+<reference_below>
+${input.referenceBelow}
+</reference_below>
+\`\`\`
+`;
 }
 
 export interface ParsedSummaryResponse {
@@ -88,7 +125,9 @@ export function parseSummaryResponse(response: string): ParsedSummaryResponse {
 	const overview = match[1].trim();
 	const problems: string[] = [];
 	if (!overview) problems.push("overview is empty");
-	if (overview.length > 200) problems.push("overview exceeds 200 characters");
+	if (overview.length > OVERVIEW_MAX_CHARS) {
+		problems.push(`overview exceeds ${OVERVIEW_MAX_CHARS} characters`);
+	}
 	if (/[\r\n]/.test(overview)) problems.push("overview must be one line");
 	return { overview, summary: match[2].trim(), problems };
 }
@@ -105,26 +144,20 @@ export function validateSummary(summary: string, cardTokens: number, budgetToken
 	const trimmed = summary.trim();
 	if (!trimmed) problems.push("summary is empty");
 	if (/^\s{0,3}#{1,6}\s+Goal\b/im.test(trimmed)) problems.push("Goal is not allowed in compact blocks");
-	if (trimmed && !trimmed.startsWith(REQUIRED_HEADINGS[0])) problems.push("summary must start with Constraints & Preferences");
-	const topLevelHeadings = [...trimmed.matchAll(/^##\s+[^#].*$/gm)].map((match) => match[0]);
-	if (topLevelHeadings.length !== REQUIRED_HEADINGS.length
-		|| topLevelHeadings.some((heading, index) => heading !== REQUIRED_HEADINGS[index])) {
-		problems.push("top-level headings must appear exactly once in the required order");
+	if (trimmed && !trimmed.startsWith("<progress>")) problems.push("summary must start with <progress>");
+	let lastIndex = -1;
+	for (const tag of REQUIRED_STRUCTURE_TAGS) {
+		const index = trimmed.indexOf(tag);
+		if (index < 0) {
+			problems.push(`missing ${tag}`);
+			continue;
+		}
+		if (index < lastIndex) problems.push(`${tag} out of order`);
+		lastIndex = Math.max(lastIndex, index + tag.length);
 	}
-	for (const heading of REQUIRED_HEADINGS) {
-		if (!trimmed.includes(heading)) problems.push(`missing heading ${heading}`);
-	}
-	const progressHeadings = [...trimmed.matchAll(/^###\s+.*$/gm)].map((match) => match[0]);
-	if (progressHeadings.length !== REQUIRED_PROGRESS_HEADINGS.length
-		|| progressHeadings.some((heading, index) => heading !== REQUIRED_PROGRESS_HEADINGS[index])) {
-		problems.push("Progress subheadings must be Done, In Progress, and Blocked exactly once in that order");
-	}
-	for (const tag of ["<read-files>", "</read-files>", "<modified-files>", "</modified-files>"]) {
-		if (!trimmed.includes(tag)) problems.push(`missing ${tag}`);
-	}
-	const modifiedEnd = trimmed.indexOf("</modified-files>");
-	if (modifiedEnd >= 0 && trimmed.slice(modifiedEnd + "</modified-files>".length).trim()) {
-		problems.push("content after </modified-files> is not allowed");
+	const modifiedEnd = trimmed.indexOf("</modified_files>");
+	if (modifiedEnd >= 0 && trimmed.slice(modifiedEnd + "</modified_files>".length).trim()) {
+		problems.push("content after </modified_files> is not allowed");
 	}
 	const overBudget = cardTokens > budgetTokens;
 	if (overBudget) problems.push(`card uses ${cardTokens} tokens, limit is ${budgetTokens}`);
@@ -132,7 +165,7 @@ export function validateSummary(summary: string, cardTokens: number, budgetToken
 }
 
 export function rewriteInstruction(validation: SummaryValidation | { problems: string[] }): string {
-	return `\n\nThe previous output was invalid (${validation.problems.join("; ")}). Rewrite the entire response once, including a one-line <overview> block and the exact Markdown structure; remove Goal and fit the card budget.`;
+	return `\n\nThe previous output was invalid (${validation.problems.join("; ")}). Rewrite the entire response once, including a one-line <overview> block and the exact compaction block structure; remove Goal and fit the card budget.`;
 }
 
 /** Estimate the final visible card using the real message estimator. */
@@ -145,7 +178,8 @@ export function cardTokensFor(
 	const card = renderBlockCard({
 		blockId: nextBlockId(sequence),
 		level: input.level,
-		sourceEntryIds: input.sourceEntryIds,
+		startEntryId: input.sourceEntryIds[0] ?? "?",
+		endEntryId: input.sourceEntryIds.at(-1) ?? "?",
 		sourceTokens: input.sourceTokens,
 		summary,
 	});
