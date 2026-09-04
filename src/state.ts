@@ -25,8 +25,8 @@ function validBlock(value: unknown): value is PluginState["blocks"][number] {
 		&& typeof block.level === "number" && Number.isInteger(block.level) && block.level >= 1
 		&& typeof block.overview === "string" && block.overview.trim().length > 0
 		&& !/[\r\n]/.test(block.overview)
-		&& Array.isArray(block.sourceEntryIds) && block.sourceEntryIds.length > 0
-		&& block.sourceEntryIds.every((id) => typeof id === "string")
+		&& typeof block.startEntryId === "string" && block.startEntryId.length > 0
+		&& typeof block.endEntryId === "string" && block.endEntryId.length > 0
 		&& Array.isArray(block.childBlockIds) && block.childBlockIds.every((id) => typeof id === "string")
 		&& typeof block.summary === "string"
 		&& typeof block.createdAt === "string"
@@ -38,7 +38,7 @@ function validBlock(value: unknown): value is PluginState["blocks"][number] {
 function validState(parsed: unknown): parsed is PluginState {
 	if (!parsed || typeof parsed !== "object") return false;
 	const state = parsed as Record<string, unknown>;
-	if (state.schemaVersion !== 3
+	if (state.schemaVersion !== 4
 		|| !Array.isArray(state.blocks)
 		|| !Array.isArray(state.topLevelBlockIds)
 		|| typeof state.childBlockIdsByParent !== "object"
@@ -58,15 +58,14 @@ function validState(parsed: unknown): parsed is PluginState {
 	const blockIds = (state.blocks as PluginState["blocks"]).map((block) => block.blockId);
 	if (new Set(blockIds).size !== blockIds.length) return false;
 	const blockById = new Map((state.blocks as PluginState["blocks"]).map((block) => [block.blockId, block] as const));
-	// Every immutable edge must descend and preserve the parent's exact ordered source range.
+	// Every immutable edge must descend and preserve the parent's boundary IDs.
 	const validChildren = (parentId: string, childIds: string[]): boolean => {
 		const parent = blockById.get(parentId);
 		if (!parent || childIds.length === 0) return false;
 		const children = childIds.map((id) => blockById.get(id));
 		return children.every((child) => child !== undefined && child.level < parent.level)
-			&& children.flatMap((child) => child?.sourceEntryIds ?? []).length === parent.sourceEntryIds.length
-			&& children.flatMap((child) => child?.sourceEntryIds ?? [])
-				.every((sourceId, index) => sourceId === parent.sourceEntryIds[index]);
+			&& children[0]?.startEntryId === parent.startEntryId
+			&& children.at(-1)?.endEntryId === parent.endEntryId;
 	};
 	for (const block of state.blocks as PluginState["blocks"]) {
 		if (block.level === 1 ? block.childBlockIds.length !== 0 : !validChildren(block.blockId, block.childBlockIds)) return false;

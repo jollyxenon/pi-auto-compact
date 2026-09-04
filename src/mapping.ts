@@ -17,8 +17,7 @@ function messageSignature(message: AgentMessage): string {
 	return signature;
 }
 
-/** Best-effort mapping: entry messages that survive intact are matched in order;
- * messages mutated or injected by other extensions stay null instead of failing the whole projection. */
+/** Map intact entry messages in order; messages injected or changed by other extensions remain null. */
 export function buildMapping(visibleEntries: SessionEntry[], messages: AgentMessage[]): EntryMessageMapping {
 	const expected = visibleEntries.flatMap((entry) => {
 		try {
@@ -61,93 +60,133 @@ export function activeChildFrontier(entries: SessionEntry[], state: PluginState)
 	return byBranch.__root__ ?? {};
 }
 
+interface EntrySpan {
+	block: CompactBlock;
+	start: number;
+	end: number;
+}
+
+/** Resolve a block from its inclusive boundary IDs without validating interior entry identity. */
+function entrySpan(block: CompactBlock, positions: Map<string, number>): EntrySpan | null {
+	const start = positions.get(block.startEntryId);
+	const end = positions.get(block.endEntryId);
+	return start === undefined || end === undefined || end < start ? null : { block, start, end };
+}
+
 /** Return active top-level blocks in source order for the current branch. */
 export function activeTopBlocks(entries: SessionEntry[], state: PluginState): CompactBlock[] {
-	const position = new Map(entries.map((entry, index) => [entry.id, index] as const));
+	const positions = new Map(entries.map((entry, index) => [entry.id, index] as const));
 	const byId = new Map(state.blocks.map((block) => [block.blockId, block] as const));
-	// With no stored frontier for this path, reconstruct conservatively from the whole
-	// block repository: invalid blocks descend to children, foreign-branch blocks vanish.
 	const frontierIds = frontierIdsForEntries(entries, state) ?? state.blocks.map((block) => block.blockId);
 	const topPosition = new Map(frontierIds.map((id, index) => [id, index] as const));
-	const isValid = (block: CompactBlock): boolean => {
-		if (block.sourceEntryIds.length === 0) return false;
-		let previous = -1;
-		for (const sourceId of block.sourceEntryIds) {
-			const current = position.get(sourceId);
-			if (current === undefined || current <= previous) return false;
-			previous = current;
-		}
-		return true;
-	};
 	const frontier = (blockId: string, visiting = new Set<string>()): CompactBlock[] => {
 		if (visiting.has(blockId)) return [];
 		const block = byId.get(blockId);
 		if (!block) return [];
-		if (isValid(block)) return [block];
+		if (entrySpan(block, positions)) return [block];
 		const nextVisiting = new Set(visiting).add(blockId);
 		return block.childBlockIds.flatMap((childId) => frontier(childId, nextVisiting));
 	};
 	const candidates = frontierIds.flatMap((id) => frontier(id));
 	const unique = [...new Map(candidates.map((block) => [block.blockId, block] as const)).values()];
-	const ordered = unique.sort((left, right) => {
-		const leftStart = position.get(left.sourceEntryIds[0]) ?? Number.MAX_SAFE_INTEGER;
-		const rightStart = position.get(right.sourceEntryIds[0]) ?? Number.MAX_SAFE_INTEGER;
-		return leftStart - rightStart
-			|| right.sourceEntryIds.length - left.sourceEntryIds.length
-			|| right.level - left.level
-			|| (topPosition.get(left.blockId) ?? Number.MAX_SAFE_INTEGER) - (topPosition.get(right.blockId) ?? Number.MAX_SAFE_INTEGER);
-	});
-	const occupied = new Set<string>();
-	const active: CompactBlock[] = [];
-	for (const block of ordered) {
-		if (block.sourceEntryIds.some((sourceId) => occupied.has(sourceId))) continue;
-		active.push(block);
-		for (const sourceId of block.sourceEntryIds) occupied.add(sourceId);
+	const spans = unique
+		.map((block) => entrySpan(block, positions))
+		.filter((span): span is EntrySpan => span !== null)
+		.sort((left, right) => left.start - right.start
+			|| right.end - left.end
+			|| right.block.level - left.block.level
+			|| (topPosition.get(left.block.blockId) ?? Number.MAX_SAFE_INTEGER)
+				- (topPosition.get(right.block.blockId) ?? Number.MAX_SAFE_INTEGER));
+	const active: EntrySpan[] = [];
+	for (const span of spans) {
+		if (active.some((selected) => span.start <= selected.end && selected.start <= span.end)) continue;
+		active.push(span);
 	}
-	return active.sort((left, right) =>
-		(position.get(left.sourceEntryIds[0]) ?? 0) - (position.get(right.sourceEntryIds[0]) ?? 0),
-	);
+	return active.sort((left, right) => left.start - right.start).map(({ block }) => block);
 }
 
+/** Replace compact intervals with cards and keep their entire envelope free of raw entries. */
 export function projectSessionEntries(visibleEntries: SessionEntry[], blocks: CompactBlock[]): AgentMessage[] {
-	const covered = new Map<string, CompactBlock>();
-	const insertAt = new Map<string, CompactBlock>();
-	for (const block of blocks) {
-		for (const sourceId of block.sourceEntryIds) covered.set(sourceId, block);
-		insertAt.set(block.sourceEntryIds[0], block);
-	}
+	const positions = new Map(visibleEntries.map((entry, index) => [entry.id, index] as const));
+	const spans = blocks
+		.map((block) => entrySpan(block, positions))
+		.filter((span): span is EntrySpan => span !== null)
+		.sort((left, right) => left.start - right.start);
+	const byStart = new Map(spans.map((span) => [span.start, span] as const));
+	const envelopeStart = spans[0]?.start;
+	const envelopeEnd = spans.at(-1)?.end;
 	const messages: AgentMessage[] = [];
-	for (const entry of visibleEntries) {
-		const block = insertAt.get(entry.id);
-		if (block) messages.push({ role: "user", content: renderBlockCard(block), timestamp: Date.now() });
-		if (covered.has(entry.id)) continue;
-		messages.push(...sessionEntryToContextMessages(entry));
+	for (let index = 0; index < visibleEntries.length; index++) {
+		const span = byStart.get(index);
+		if (span) {
+			messages.push({ role: "user", content: renderBlockCard(span.block), timestamp: Date.now() });
+			index = span.end;
+			continue;
+		}
+		if (envelopeStart !== undefined && envelopeEnd !== undefined && envelopeStart <= index && index <= envelopeEnd) continue;
+		messages.push(...sessionEntryToContextMessages(visibleEntries[index]));
 	}
 	return messages;
 }
 
+interface MessageSpan {
+	block: CompactBlock;
+	start: number;
+	end: number;
+}
+
+/** Resolve the full message interval between a block's boundary entries. */
+function messageSpans(mapping: EntryMessageMapping, blocks: CompactBlock[]): MessageSpan[] {
+	const spans: MessageSpan[] = [];
+	for (const block of blocks) {
+		const start = mapping.messageEntryIds.findIndex((id) => id === block.startEntryId);
+		let end = -1;
+		for (let index = mapping.messageEntryIds.length - 1; index >= 0; index--) {
+			if (mapping.messageEntryIds[index] === block.endEntryId) {
+				end = index;
+				break;
+			}
+		}
+		if (start >= 0 && end >= start) spans.push({ block, start, end });
+	}
+	return spans.sort((left, right) => left.start - right.start);
+}
+
+/** Keep only unmatched messages outside the complete compact-block envelope. */
+export function unmatchedMessagesOutsideBlocks(
+	messages: AgentMessage[],
+	mapping: EntryMessageMapping,
+	blocks: CompactBlock[],
+): AgentMessage[] {
+	const spans = messageSpans(mapping, blocks);
+	const envelopeStart = spans[0]?.start;
+	const envelopeEnd = spans.at(-1)?.end;
+	return messages.filter((_message, index) =>
+		mapping.messageEntryIds[index] === null
+		&& (envelopeStart === undefined || envelopeEnd === undefined || index < envelopeStart || index > envelopeEnd));
+}
+
+/** Replace complete mapped intervals and keep their entire envelope free of raw messages. */
 export function projectMessages(
 	messages: AgentMessage[],
 	mapping: EntryMessageMapping,
 	blocks: CompactBlock[],
 ): AgentMessage[] {
 	if (blocks.length === 0) return messages;
-	const blockBySourceId = new Map<string, CompactBlock>();
-	const insertAt = new Map<number, CompactBlock>();
-	for (const block of blocks) {
-		for (const sourceId of block.sourceEntryIds) {
-			if (blockBySourceId.has(sourceId)) return messages;
-			blockBySourceId.set(sourceId, block);
-		}
-		const firstIndex = mapping.messageEntryIds.findIndex((id) => id !== null && block.sourceEntryIds.includes(id));
-		if (firstIndex >= 0) insertAt.set(firstIndex, block);
-	}
+	const spans = messageSpans(mapping, blocks);
+	if (spans.some((span, index) => index > 0 && span.start <= spans[index - 1].end)) return messages;
+	const byStart = new Map(spans.map((span) => [span.start, span] as const));
+	const envelopeStart = spans[0]?.start;
+	const envelopeEnd = spans.at(-1)?.end;
 	const output: AgentMessage[] = [];
 	for (let index = 0; index < messages.length; index++) {
-		const block = insertAt.get(index);
-		if (block) output.push({ role: "user", content: renderBlockCard(block), timestamp: Date.now() });
-		const entryId = mapping.messageEntryIds[index];
-		if (entryId !== null && blockBySourceId.has(entryId)) continue;
+		const span = byStart.get(index);
+		if (span) {
+			output.push({ role: "user", content: renderBlockCard(span.block), timestamp: Date.now() });
+			index = span.end;
+			continue;
+		}
+		if (envelopeStart !== undefined && envelopeEnd !== undefined && envelopeStart <= index && index <= envelopeEnd) continue;
 		output.push(messages[index]);
 	}
 	return output;

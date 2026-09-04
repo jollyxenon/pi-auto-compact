@@ -5,8 +5,9 @@ export interface CompactBlock {
 	level: number;
 	/** One-line description used by block-tree inspection. */
 	overview: string;
-	/** Ordered original Pi session entry IDs covered by this block. */
-	sourceEntryIds: string[];
+	/** Inclusive boundary IDs in the original Pi session branch. */
+	startEntryId: string;
+	endEntryId: string;
 	/** Direct children. Empty only for level-1 blocks. */
 	childBlockIds: string[];
 	summary: string;
@@ -17,7 +18,7 @@ export interface CompactBlock {
 }
 
 export interface PluginState {
-	schemaVersion: 3;
+	schemaVersion: 4;
 	/** Immutable block repository. Children remain available after promotion. */
 	blocks: CompactBlock[];
 	/** Ordered blocks currently projected into the model context. */
@@ -32,7 +33,7 @@ export interface PluginState {
 }
 
 export function freshState(): PluginState {
-	return { schemaVersion: 3, blocks: [], topLevelBlockIds: [], childBlockIdsByParent: {}, nextSeq: 1 };
+	return { schemaVersion: 4, blocks: [], topLevelBlockIds: [], childBlockIdsByParent: {}, nextSeq: 1 };
 }
 
 export interface EntryMessageMapping {
@@ -41,7 +42,12 @@ export interface EntryMessageMapping {
 }
 
 export interface SummarizeInput {
-	referenceContext: string;
+	/** Active session system prompt; read-only context. */
+	systemPrompt: string;
+	/** History compaction block cards referenced above the target range. */
+	referenceAbove: string;
+	/** Uncompressed source content and injected messages referenced below the target. */
+	referenceBelow: string;
 	targetRange: string;
 	sourceEntryIds: string[];
 	sourceTokens: number;

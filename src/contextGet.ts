@@ -178,8 +178,10 @@ function executeContextGet(
 	if (query.kind === "block") {
 		const block = state.blocks.find((item) => item.blockId === query.blockId);
 		if (!block) return `Error: block ${query.blockId} does not exist`;
-		if (block.sourceEntryIds.some((id) => !positions.has(id))) return `Error: block ${query.blockId} is not on the active branch`;
-		ids = block.sourceEntryIds;
+		const first = positions.get(block.startEntryId);
+		const last = positions.get(block.endEntryId);
+		if (first === undefined || last === undefined || last < first) return `Error: block ${query.blockId} is not on the active branch`;
+		ids = branch.slice(first, last + 1).map((entry) => entry.id);
 		header = `Historical block ${block.blockId} (level ${block.level})`;
 	} else {
 		const first = positions.get(query.startId);

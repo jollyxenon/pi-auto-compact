@@ -176,8 +176,8 @@ export async function blockTree(ctx: ExtensionContext, state: PluginState): Prom
 					lines.push(truncateToWidth(index === cursor ? theme.fg("accent", prefix + overview) : prefix + overview, width, "..."));
 				}
 				const current = rows[cursor].block;
-				const first = current.sourceEntryIds[0] ?? "?";
-				const last = current.sourceEntryIds.at(-1) ?? "?";
+				const first = current.startEntryId;
+				const last = current.endEntryId;
 				lines.push("", theme.fg("muted", `${current.blockId} · L${current.level} · ${first}..${last} · ${current.sourceTokens} tokens`));
 				lines.push(...wrapTextWithAnsi(current.overview, Math.max(1, width)).map((line) => theme.fg("text", line)));
 				lines.push("", theme.fg("dim", "↑↓ 浏览  ← 折叠  → 展开  Enter 操作  Esc 退出"));

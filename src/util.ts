@@ -67,11 +67,9 @@ export function nextBlockId(sequence: number): string {
 	return `ac_${sequence.toString().padStart(6, "0")}`;
 }
 
-export function renderBlockCard(block: Pick<CompactBlock, "blockId" | "level" | "sourceEntryIds" | "sourceTokens" | "summary">): string {
-	const first = block.sourceEntryIds[0] ?? "?";
-	const last = block.sourceEntryIds.at(-1) ?? "?";
+export function renderBlockCard(block: Pick<CompactBlock, "blockId" | "level" | "startEntryId" | "endEntryId" | "sourceTokens" | "summary">): string {
 	return [
-		`[Historical block ${block.blockId} | level ${block.level} | ${first}..${last} | source ${block.sourceTokens} tokens]`,
+		`[Historical block ${block.blockId} | level ${block.level} | ${block.startEntryId}..${block.endEntryId} | source ${block.sourceTokens} tokens]`,
 		`Original context is available with context_get({"blockId":"${block.blockId}"}).`,
 		block.summary,
 	].join("\n");
