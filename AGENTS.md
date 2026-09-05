@@ -16,7 +16,7 @@ npm pack --dry-run
 
 - 自动压缩从当前可见 session context 中第一条参与 LLM context 的消息开始；系统提示词、AGENTS.md、工具描述和 Skill 描述由 Pi 单独管理，不属于 session entry。
 - `CompactBlock` 不可变，只记录 `startEntryId` 与 `endEntryId`，不记录或核验区间内 Entry ID 序列；高层块保留创建时的直接子块引用，低层块不删除。节点身份由其有序 level-1 叶子序列决定；再次形成相同叶子序列时复用旧块，不重新摘要。每个新块在同一次摘要请求中生成单行 `overview` 和详细 `summary`；`overview` 只用于块树检查，不进入模型上下文卡片。
-- 当前活动顶层块从首块头到末块尾构成纯净压缩区；块内部和块间后来插入的消息一律丢弃，不后移、不进入 `REFERENCE_CONTEXT`，压缩区外的注入消息保留。
+- 当前活动顶层块从首块头到末块尾构成纯净压缩区；块内部和块间后来插入的消息一律丢弃，不后移、不进入 `REFERENCE_CONTEXT`，压缩区外的注入消息保留。消息投影按完整 entry 区间定位其中实际存在的消息；首尾 entry 可以不产生模型消息，不得因此漏掉整个块。
 - `topLevelBlockIds` 与 `childBlockIdsByParent` 只表示当前稳定树投影；其他分支块不能参与当前分支重平衡。分支前沿索引保存各活动路径的根前沿和内部子前沿选择，不改变块仓库的不可变性。
 - `blockMergeThreshold = k` 表示出现第 `k + 1` 个连续同级块后合并最旧 `k` 个。
 - 摘要、全部连锁提升和 sidecar 写入成功后才能替换内存状态。

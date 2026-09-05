@@ -35,7 +35,10 @@ export function buildMapping(visibleEntries: SessionEntry[], messages: AgentMess
 		messageEntryIds[match] = item.entryId;
 		cursor = match + 1;
 	}
-	return { messageEntryIds };
+	return {
+		entryPositions: new Map(visibleEntries.map((entry, index) => [entry.id, index])),
+		messageEntryIds,
+	};
 }
 
 /** Return the stored frontier for the current path, or null when no stored key matches. */
@@ -135,19 +138,22 @@ interface MessageSpan {
 	end: number;
 }
 
-/** Resolve the full message interval between a block's boundary entries. */
+/** Resolve messages within inclusive entry boundaries, which may themselves have no messages. */
 function messageSpans(mapping: EntryMessageMapping, blocks: CompactBlock[]): MessageSpan[] {
+	const positions = mapping.messageEntryIds.map((id) => id === null ? undefined : mapping.entryPositions.get(id));
 	const spans: MessageSpan[] = [];
 	for (const block of blocks) {
-		const start = mapping.messageEntryIds.findIndex((id) => id === block.startEntryId);
+		const sourceSpan = entrySpan(block, mapping.entryPositions);
+		if (!sourceSpan) continue;
+		let start = -1;
 		let end = -1;
-		for (let index = mapping.messageEntryIds.length - 1; index >= 0; index--) {
-			if (mapping.messageEntryIds[index] === block.endEntryId) {
-				end = index;
-				break;
-			}
+		for (let index = 0; index < positions.length; index++) {
+			const position = positions[index];
+			if (position === undefined || position < sourceSpan.start || position > sourceSpan.end) continue;
+			if (start < 0) start = index;
+			end = index;
 		}
-		if (start >= 0 && end >= start) spans.push({ block, start, end });
+		if (start >= 0) spans.push({ block, start, end });
 	}
 	return spans.sort((left, right) => left.start - right.start);
 }

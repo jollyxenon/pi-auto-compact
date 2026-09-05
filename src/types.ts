@@ -37,6 +37,8 @@ export function freshState(): PluginState {
 }
 
 export interface EntryMessageMapping {
+	/** Positions of all visible entries, including entries with no context messages. */
+	entryPositions: Map<string, number>;
 	/** null marks a message injected by another context extension. */
 	messageEntryIds: Array<string | null>;
 }
