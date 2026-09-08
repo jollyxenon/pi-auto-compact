@@ -12,12 +12,14 @@
 	},
 	"peerDependencies": {
 		"@earendil-works/pi-agent-core": "*",
+		"@earendil-works/pi-ai": "*",
 		"@earendil-works/pi-coding-agent": "*",
 		"@earendil-works/pi-tui": "*",
 		"typebox": "*"
 	},
 	"devDependencies": {
 		"@earendil-works/pi-agent-core": "file:/home/xenon/.local/share/fnm/node-versions/v24.16.0/installation/lib/node_modules/@earendil-works/pi-coding-agent/node_modules/@earendil-works/pi-agent-core",
+		"@earendil-works/pi-ai": "file:/home/xenon/.local/share/fnm/node-versions/v24.16.0/installation/lib/node_modules/@earendil-works/pi-coding-agent/node_modules/@earendil-works/pi-ai",
 		"@earendil-works/pi-coding-agent": "file:/home/xenon/.local/share/fnm/node-versions/v24.16.0/installation/lib/node_modules/@earendil-works/pi-coding-agent",
 		"@earendil-works/pi-tui": "file:/home/xenon/.local/share/fnm/node-versions/v24.16.0/installation/lib/node_modules/@earendil-works/pi-coding-agent/node_modules/@earendil-works/pi-tui",
 		"@types/node": "^24.0.0",

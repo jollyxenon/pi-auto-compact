@@ -10,6 +10,7 @@ import {
 	cardTokensFor,
 	parseSummaryResponse,
 	rewriteInstruction,
+	summaryOutputTokenLimit,
 	validateSummary,
 } from "./summarizer.ts";
 import type { CompactBlock, PluginState, SummarizeInput } from "./types.ts";
@@ -102,7 +103,8 @@ interface PreparedInput {
 	fits: boolean;
 }
 
-const SUMMARY_REWRITE_RESERVE = 256;
+// Match Pi's streamSimple input safety margin, plus room for a structural rewrite.
+const SUMMARY_REWRITE_RESERVE = 4096 + 256;
 
 /** Stop an operation before it can produce or commit a result. */
 function throwIfAborted(deps: CompressDeps): void {
@@ -154,16 +156,16 @@ function estimateTextTokens(deps: CompressDeps, text: string): number {
 }
 
 /** Reserve enough room for the generated card and one structural rewrite. */
-function summaryRequestTokensForPrompt(deps: CompressDeps, prompt: string, budgetTokens: number): number {
+function summaryRequestTokensForPrompt(deps: CompressDeps, prompt: string): number {
 	return estimateTextTokens(deps, SUMMARIZER_SYSTEM_PROMPT)
 		+ estimateTextTokens(deps, prompt)
-		+ Math.max(budgetTokens * 2, 2048)
+		+ summaryOutputTokenLimit(deps.cfg.blockTokenCeiling)
 		+ SUMMARY_REWRITE_RESERVE;
 }
 
 /** Estimate the complete request that would be sent to the summary model. */
 function summaryRequestTokens(deps: CompressDeps, input: SummarizeInput): number {
-	return summaryRequestTokensForPrompt(deps, buildSummarizePrompt(input), input.budgetTokens);
+	return summaryRequestTokensForPrompt(deps, buildSummarizePrompt(input));
 }
 
 /** A cut point is immediately before the next user or assistant message. */
@@ -298,7 +300,7 @@ async function summarizeBlock(
 ): Promise<{ block?: CompactBlock; error?: string }> {
 	throwIfAborted(deps);
 	const prompt = buildSummarizePrompt(input);
-	const firstRequestTokens = summaryRequestTokensForPrompt(deps, prompt, input.budgetTokens);
+	const firstRequestTokens = summaryRequestTokensForPrompt(deps, prompt);
 	if (firstRequestTokens > deps.contextWindow) {
 		return { error: `summary request needs about ${firstRequestTokens} tokens, window is ${deps.contextWindow}` };
 	}
@@ -310,7 +312,7 @@ async function summarizeBlock(
 	let problems = [...parsed.problems, ...validation.problems];
 	if (problems.length > 0) {
 		const rewritePrompt = prompt + rewriteInstruction({ problems });
-		const rewriteRequestTokens = summaryRequestTokensForPrompt(deps, rewritePrompt, input.budgetTokens);
+		const rewriteRequestTokens = summaryRequestTokensForPrompt(deps, rewritePrompt);
 		if (rewriteRequestTokens > deps.contextWindow) {
 			return { error: `summary rewrite needs about ${rewriteRequestTokens} tokens, window is ${deps.contextWindow}` };
 		}

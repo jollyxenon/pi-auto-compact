@@ -7,6 +7,11 @@ import { nextBlockId, renderBlockCard, type TokenEstimator } from "./util.ts";
 export const SUMMARIZER_SYSTEM_PROMPT =
 	"You are requested to compress the context of this session. Compress according to the format specifications provided below.";
 
+/** Reserve one fixed output cap for both planning and provider requests. */
+export function summaryOutputTokenLimit(blockTokenCeiling: number): number {
+	return Math.max(blockTokenCeiling * 2, 2048);
+}
+
 /** Structural tags the compaction body must contain, in this exact order. */
 export const REQUIRED_STRUCTURE_TAGS = [
 	"<progress>",

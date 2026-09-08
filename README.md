@@ -16,6 +16,8 @@
 - 插件接管 Pi footer 的上下文占用字段，按实际发送给模型的压缩后投影重新计算 `xx%/context_limit`；累计 token、费用、目录、分支和模型信息仍保留。
 - 自动压缩从当前可见 session context 中第一条参与 LLM context 的消息开始；系统提示词、AGENTS.md、工具描述和 Skill 描述由 Pi 单独管理，不属于 session entry。主会话系统提示词会作为只读参考传给摘要模型。摘要校验仍拒绝 `Goal`。
 - 最近上下文由 `keepRecent` 保护，自动压缩不会触碰当前未完成尾部。
+- 摘要使用当前会话模型和有效思考等级，通过 Pi 已注册提供方的 `streamSimple` 构造请求；不会因省略参数而把主对话的 `high` 等等级变成关闭思考。摘要仍是独立请求，保留 `cacheRetention: "none"`，不调用主对话的请求修改事件。
+- 摘要沿用 Pi `settings.json` 的 `retry.enabled`、`retry.maxRetries` 和 `retry.baseDelayMs`，默认对临时连接、限流和服务端错误最多重试 3 次，间隔为 2、4、8 秒；重试前显示通知。使用 Pi 的错误分类，不对笼统的 400、鉴权或额度耗尽错误盲目重试。只在完整请求层重试，底层 SDK 重试次数固定为 0，避免两层重试相乘。
 - 恢复已有会话时，`/auto-compact` 会从当前可见上下文的第一条可转换消息重新扫描，并模拟沿 context 前进的过程：先压缩最早能放入摘要请求的完整区间，生成的块随后作为参考上下文继续处理后续区间，直到保护尾部之前没有未压缩内容。Pi 原生 `compaction` 不会作为目标范围，也不会进入参考区。
 
 ## 安装
@@ -164,6 +166,8 @@ pi -e /home/xenon/pi-auto-compact
 
 上述三部分互不重叠，共同覆盖摘要所需当前投影。对于已经超过模型窗口的会话，插件按完整 entry 或完整块卡片缩小参考区；原始完整内容仍保留在 session JSONL 中。
 
+范围选择与请求发送共同使用 `max(2 * blockTokenCeiling, 2048)` 作为输出预留；实际请求还受模型输出上限约束。思考与摘要合计不能超过这一上限；范围选择额外预留 Pi 适配器的 4096 token 输入余量和 256 token 重写余量。level-1 因净收益要求而缩小卡片预算时，不会错误地同步缩小请求输出预留。模型达到输出上限而未正常结束时，仍拒绝提交，不硬截断摘要。
+
 摘要采用固定输出协议：模型先生成不超过 50 字符的一句话概述，供 `/auto-compact-blocks` 的树视图显示；随后生成 `<progress>`（含 `<done>`、`<doing>`、`<todo>`）、`<blocked>`、`<decision>`、`<critical_content>`、`<read_files>`、`<modified_files>` 组成的详细压缩块。两者在同一次模型请求中生成，概述只写入块元数据，不进入投影给模型的块卡片。level-1 完整卡片预算同时受 `blockTokenCeiling` 和 `minNetGainTokens` 约束，确保生成结果达到最低净收益；第一次输出不合格时重写一次，仍不合格则整次操作回滚。插件不会硬截断摘要。
 
 ## 状态与故障语义
@@ -174,9 +178,17 @@ pi -e /home/xenon/pi-auto-compact
 <session>.autocompact.json
 ```
 
-原始消息仍在 Pi 的 append-only session JSONL 中。当前 sidecar schema 为 4；块只持久化 `startEntryId` 和 `endEntryId`，`context_get` 在当前活动分支上按这两个边界动态读取完整区间。旧 schema 升级后会按无效旧结构隔离为 `.corrupt-<时间戳>`，再从空状态重建。sidecar 使用临时文件加 rename 写入；同时按活动路径保存顶层前沿和每个父节点当前选中的子前沿，切换分支时不会让其他分支参与当前投影或树结构。写入、摘要或任一级提升失败时，当前内存投影保持不变。sidecar 无法解析或结构校验失败（缺少字段、块 ID 重复、子块引用不存在、序号回退）时，原文件重命名为 `<session>.autocompact.json.corrupt-<时间戳>` 留存排查，插件从空状态重建。
+原始消息仍在 Pi 的 append-only session JSONL 中。当前 sidecar schema 为 4；块只持久化 `startEntryId` 和 `endEntryId`，`context_get` 在当前活动分支上按这两个边界动态读取完整区间。旧 schema 升级后会按无效旧结构隔离为 `.corrupt-<时间戳>`，再从空状态重建。sidecar 使用临时文件加 rename 写入；同时按活动路径保存顶层前沿和每个父节点当前选中的子前沿，切换分支时不会让其他分支参与当前投影或树结构。写入、摘要或任一级提升失败时，当前内存投影保持不变。sidecar 不存在时正常使用空状态，不报警；权限等其他读取错误会明确报错并中止本次加载，不隔离原文件。sidecar 无法解析或结构校验失败（缺少字段、块 ID 重复、子块引用不存在、序号回退）时，原文件重命名为 `<session>.autocompact.json.corrupt-<时间戳>` 留存排查，插件从空状态重建。
 
-插件取消 Pi 原生压缩，并始终接管手动、threshold 和 overflow 压缩；即使插件没有产出可提交状态（例如收益不足、摘要失败或请求预算不足）也取消原生行为，不回退到原生 compact。插件等待摘要期间会阻止另一轮插件压缩并发启动，避免 session leaf 改变后丢弃结果。压缩进行中，`tree`/`fork`/`clone`/`new`/`resume` 会被取消，`/reload` 会在输入层被拦截；按下 Esc（会话内的模型请求 signal）或退出（session_shutdown）会中断摘要请求并丢弃未提交的部分结果。若配置让受保护尾部本身接近或超过模型窗口，自动压缩将找不到可处理区间；此时应降低 `keepRecent` 或 `trigger`，再执行 `/auto-compact-config`。
+插件取消 Pi 原生压缩，并始终接管手动、threshold 和 overflow 压缩；即使插件没有产出可提交状态（例如收益不足、摘要失败或请求预算不足）也取消原生行为，不回退到原生 compact。插件等待摘要期间会阻止另一轮插件压缩并发启动，避免 session leaf 改变后丢弃结果。压缩进行中，`tree`/`fork`/`clone`/`new`/`resume` 会被取消，`/reload` 会在输入层被拦截；按下 Esc（包括空闲时发起的 `/auto-compact`）或退出（session_shutdown）会中断摘要请求及重试等待，并丢弃未提交的部分结果。若配置让受保护尾部本身接近或超过模型窗口，自动压缩将找不到可处理区间；此时应降低 `keepRecent` 或 `trigger`，再执行 `/auto-compact-config`。
+
+## 摘要请求排查
+
+主对话能成功不代表摘要参数相同。此次在本机 `litellm-gpt/gpt-6-astra` 路由上，以相同小请求验证：旧调用省略思考设置，适配器发送 `reasoning.effort: "none"`，连续两次返回 LiteLLM 包装的 400 `Bad Request / upstream_error`；仅传入有效等级 `high` 后成功。修复后的摘要客户端也已通过真实请求和完整摘要格式检查。这是该路由的实测结果，不代表所有 OpenAI 模型都不支持 `none`。
+
+在 `/auto-compact-config` 开启 `运行时调试日志` 后，`~/.pi/agent/pi-debug.log` 会记录每次摘要请求的提供方、模型、API、思考等级、估算输入 token、输出上限、尝试次数、耗时、返回用量和错误，以及重试等待时间。不主动记录摘要提示词、正文、密钥或请求头；上游错误原文仍可能包含服务端返回的敏感信息，分享日志前应检查。重试与超时设置通过 Pi 的设置读取器加载，项目设置仅在项目受信任时生效。
+
+重试仍失败时，本轮所有结果不提交，原文与之前成功的压缩状态不变；取消请求或重试等待同样不提交部分结果。Pi 的认证解析接口不接收取消信号，若正等待认证命令或 OAuth 刷新，需等解析返回后才能结束操作，但不会再发送摘要请求。持续的 502 仍需要修复上游连通性，客户端有限重试不能保证不可用服务恢复。
 
 ## 开发
 

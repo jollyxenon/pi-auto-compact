@@ -3,6 +3,7 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
+import { Key, matchesKey } from "@earendil-works/pi-tui";
 import {
 	buildSessionContext,
 	estimateTokens,
@@ -33,7 +34,7 @@ import {
 	unmatchedMessagesOutsideBlocks,
 } from "./mapping.ts";
 import { loadState, saveState, statePathFor } from "./state.ts";
-import { SUMMARIZER_SYSTEM_PROMPT } from "./summarizer.ts";
+import { createSummarizeFn } from "./summaryClient.ts";
 import { freshState, type PluginState } from "./types.ts";
 import { messageToText, renderBlockCard } from "./util.ts";
 import {
@@ -315,35 +316,6 @@ export default function autoCompactExtension(pi: ExtensionAPI) {
 		return result.finally(() => record.cleanup());
 	}
 
-	function makeSummarizeFn(ctx: ExtensionContext, signal: AbortSignal | undefined = ctx.signal): ((prompt: string) => Promise<string>) | null {
-		const model = ctx.model;
-		if (!model) return null;
-		return async (prompt: string) => {
-			const response = await ctx.modelRegistry.complete(
-				model,
-				{
-					systemPrompt: SUMMARIZER_SYSTEM_PROMPT,
-					messages: [{ role: "user", content: prompt, timestamp: Date.now() }],
-				},
-				{
-					maxTokens: Math.max(cfg.blockTokenCeiling * 2, 2048),
-					signal: signal,
-					cacheRetention: "none",
-				},
-			);
-			if (response.stopReason !== "stop") {
-				throw new Error(`summary model ended with ${response.stopReason}${response.errorMessage ? `: ${response.errorMessage}` : ""}`);
-			}
-			if (response.content.some((block) => block.type === "toolCall")) {
-				throw new Error("summary model returned a tool call instead of a summary");
-			}
-			return response.content
-				.filter((block): block is Extract<(typeof response.content)[number], { type: "text" }> => block.type === "text")
-				.map((block) => block.text)
-				.join("\n");
-		};
-	}
-
 	function buildCompressDeps(
 		ctx: ExtensionContext,
 		additionalMessages: AgentMessage[] = [],
@@ -354,7 +326,7 @@ export default function autoCompactExtension(pi: ExtensionAPI) {
 		ensureSession(ctx);
 		const usage = ctx.getContextUsage();
 		const contextWindow = usage?.contextWindow ?? ctx.model?.contextWindow ?? 0;
-		const summarizeFn = makeSummarizeFn(ctx, signal);
+		const summarizeFn = createSummarizeFn(ctx, cfg, signal, debugLog);
 		if (!summarizeFn || contextWindow <= 0) return null;
 		return {
 			cfg,
@@ -369,6 +341,7 @@ export default function autoCompactExtension(pi: ExtensionAPI) {
 			estimate: estimateTokens,
 			onProgress: (progress) => updateCompression(ctx, progress),
 			summarizeFn,
+			signal,
 		};
 	}
 
@@ -589,13 +562,17 @@ export default function autoCompactExtension(pi: ExtensionAPI) {
 		refreshProjectedUsage(ctx);
 	});
 
-	/** While a compression is running, consume the Enter that would submit /reload. */
-	function installReloadGuard(ctx: ExtensionContext): void {
+	/** Let Esc cancel idle-command compression, and block /reload while it runs. */
+	function installCompressionInputGuard(ctx: ExtensionContext): void {
 		inputGuardUnsubscribe?.();
 		inputGuardUnsubscribe = undefined;
 		if (!ctx.hasUI) return;
 		inputGuardUnsubscribe = ctx.ui.onTerminalInput((data) => {
 			if (!activeCompression) return undefined;
+			if (matchesKey(data, Key.escape)) {
+				activeCompression.controller.abort();
+				return { consume: true };
+			}
 			if (!/[\r\n]/.test(data)) return undefined;
 			if (ctx.ui.getEditorText().trim() !== "/reload") return undefined;
 			ctx.ui.notify("压缩进行中，已取消 /reload。", "warning");
@@ -639,7 +616,7 @@ export default function autoCompactExtension(pi: ExtensionAPI) {
 		footer?.dispose();
 		footer = installAutoCompactFooter(ctx, () => projectedUsage);
 		renderFooter = () => footer?.requestRender();
-		installReloadGuard(ctx);
+		installCompressionInputGuard(ctx);
 		if (event.reason === "fork" && event.previousSessionFile) {
 			try {
 				inheritForkState(event.previousSessionFile, ctx);
