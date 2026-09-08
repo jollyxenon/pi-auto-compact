@@ -111,10 +111,18 @@ function validState(parsed: unknown): parsed is PluginState {
 	return true;
 }
 
+/** Missing sidecars are normal; only malformed contents are quarantined. */
 export function loadState(path: string): PluginState {
+	let contents: string;
+	try {
+		contents = fs.readFileSync(path, "utf8");
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code === "ENOENT") return freshState();
+		throw new Error(`[auto-compact] failed to read sidecar state: ${path}`, { cause: error });
+	}
 	let parsed: unknown;
 	try {
-		parsed = JSON.parse(fs.readFileSync(path, "utf8"));
+		parsed = JSON.parse(contents);
 	} catch {
 		quarantine(path, "unparseable");
 		return freshState();
