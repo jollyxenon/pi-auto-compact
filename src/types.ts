@@ -1,5 +1,10 @@
 /** Immutable compact blocks plus the current top-level forest. */
 
+import type { ImageContent, TextContent } from "@earendil-works/pi-ai";
+
+/** Ordered prompt content; images stay image parts so provider adapters attach them. */
+export type PromptPart = TextContent | ImageContent;
+
 export interface CompactBlock {
 	blockId: string;
 	level: number;
@@ -47,10 +52,11 @@ export interface SummarizeInput {
 	/** Active session system prompt; read-only context. */
 	systemPrompt: string;
 	/** History compaction block cards referenced above the target range. */
-	referenceAbove: string;
+	referenceAbove: PromptPart[];
 	/** Uncompressed source content and injected messages referenced below the target. */
-	referenceBelow: string;
-	targetRange: string;
+	referenceBelow: PromptPart[];
+	/** The only range allowed into the summary, with images in their original positions. */
+	targetParts: PromptPart[];
 	sourceEntryIds: string[];
 	sourceTokens: number;
 	level: number;

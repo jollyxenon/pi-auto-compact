@@ -336,6 +336,7 @@ export default function autoCompactExtension(pi: ExtensionAPI) {
 				.join("\n\n"),
 			systemPrompt: ctx.getSystemPrompt(),
 			estimate: estimateTokens,
+			supportsImages: ctx.model?.input?.includes("image") ?? false,
 			onProgress: (progress) => updateCompression(ctx, progress),
 			summarizeFn,
 			signal,

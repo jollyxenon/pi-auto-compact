@@ -1,7 +1,7 @@
 /** Strict summary protocol shared by automatic and manual operations. */
 
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
-import type { SummarizeInput } from "./types.ts";
+import type { PromptPart, SummarizeInput } from "./types.ts";
 import { nextBlockId, renderBlockCard, type TokenEstimator } from "./util.ts";
 
 export const SUMMARIZER_SYSTEM_PROMPT =
@@ -29,7 +29,21 @@ export const REQUIRED_STRUCTURE_TAGS = [
 /** One-sentence overview length limit used by the compaction protocol. */
 export const OVERVIEW_MAX_CHARS = 50;
 
-export function buildSummarizePrompt(input: SummarizeInput): string {
+/** Assemble the summary request; target and reference images stay in their positions. */
+export function buildSummarizeParts(input: SummarizeInput): PromptPart[] {
+	return [
+		{ type: "text", text: instructionBlock(input) },
+		...input.referenceAbove,
+		{ type: "text", text: "\n</history_compaction_blocks>\n</reference_above>\n```\n\n```target\n<target_compaction_range>\n" },
+		...input.targetParts,
+		{ type: "text", text: "\n</target_compaction_range>\n```\n\n```reference\n<reference_below>\n" },
+		...input.referenceBelow,
+		{ type: "text", text: "\n</reference_below>\n```\n" },
+	];
+}
+
+/** Fixed instructions plus the session system prompt and the reference container header. */
+function instructionBlock(input: SummarizeInput): string {
 	return `# Context Compaction
 
 ## Compaction Specifications
@@ -98,22 +112,6 @@ The visible content of the entire session is as follows:
 ${input.systemPrompt}
 </system_prompt>
 <history_compaction_blocks>
-${input.referenceAbove}
-</history_compaction_blocks>
-</reference_above>
-\`\`\`
-
-\`\`\`target
-<target_compaction_range>
-${input.targetRange}
-</target_compaction_range>
-\`\`\`
-
-\`\`\`reference
-<reference_below>
-${input.referenceBelow}
-</reference_below>
-\`\`\`
 `;
 }
 

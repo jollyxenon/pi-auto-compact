@@ -9,8 +9,8 @@ import {
 	type CompressDeps,
 } from "../src/compress.ts";
 import type { AutoCompactConfig } from "../src/config.ts";
-import { freshState, type PluginState } from "../src/types.ts";
-import { messageToText, type TokenEstimator } from "../src/util.ts";
+import { freshState, type PluginState, type PromptPart } from "../src/types.ts";
+import { messageToText, renderPromptParts, type TokenEstimator } from "../src/util.ts";
 
 /** 与 Pi 的 estimateTokens 同规则（chars/4），内联以便测试自己掌握契约。 */
 const testEstimator: TokenEstimator = (message) => Math.max(1, Math.ceil(messageToText(message).length / 4));
@@ -90,7 +90,7 @@ function config(overrides: Partial<AutoCompactConfig> = {}): AutoCompactConfig {
 
 function deps(
 	cfg = config(),
-	summarizeFn: (prompt: string) => Promise<string> = async () => VALID_SUMMARY,
+	summarizeFn: (content: PromptPart[]) => Promise<string> = async () => VALID_SUMMARY,
 	branchEntries = entries(),
 ): CompressDeps {
 	return {
@@ -100,6 +100,7 @@ function deps(
 		systemPrompt: "test system prompt",
 		referenceContext: "complete visible projection",
 		estimate: testEstimator,
+		supportsImages: true,
 		summarizeFn,
 	};
 }
@@ -170,7 +171,7 @@ test("automatic compaction starts at the first context-visible message after met
 	];
 	let prompt = "";
 	const operation = deps(config({ keepRecent: { mode: "tokens", value: 1 } }), async (value) => {
-		prompt = value;
+		prompt = renderPromptParts(value);
 		return VALID_SUMMARY;
 	}, branch);
 	const automatic = await runAutoCompression(operation, freshState());

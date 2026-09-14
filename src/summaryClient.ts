@@ -4,6 +4,7 @@ import { retryAssistantCall } from "@earendil-works/pi-ai";
 import { estimateTokens, getAgentDir, SettingsManager, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { AutoCompactConfig } from "./config.ts";
 import { SUMMARIZER_SYSTEM_PROMPT, summaryOutputTokenLimit } from "./summarizer.ts";
+import type { PromptPart } from "./types.ts";
 
 /** Capture one operation's model settings; resolve authentication afresh on each attempt. */
 export function createSummarizeFn(
@@ -11,7 +12,7 @@ export function createSummarizeFn(
 	cfg: AutoCompactConfig,
 	signal: AbortSignal | undefined,
 	debugLog: (message: string, details?: unknown) => void,
-): ((prompt: string) => Promise<string>) | null {
+): ((content: PromptPart[]) => Promise<string>) | null {
 	const selected = ctx.model;
 	if (!selected) return null;
 	const provider = ctx.modelRegistry.getProvider(selected.provider);
@@ -27,10 +28,10 @@ export function createSummarizeFn(
 	const maxTokens = Math.min(selected.maxTokens, summaryOutputTokenLimit(cfg.blockTokenCeiling));
 	const model = { ...selected, maxTokens };
 
-	return async (prompt: string): Promise<string> => {
+	return async (content: PromptPart[]): Promise<string> => {
 		const context = {
 			systemPrompt: SUMMARIZER_SYSTEM_PROMPT,
-			messages: [{ role: "user" as const, content: prompt, timestamp: Date.now() }],
+			messages: [{ role: "user" as const, content, timestamp: Date.now() }],
 		};
 		const inputTokens = estimateTokens({ role: "user", content: SUMMARIZER_SYSTEM_PROMPT, timestamp: 0 })
 			+ estimateTokens(context.messages[0]);

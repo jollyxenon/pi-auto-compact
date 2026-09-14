@@ -6,15 +6,15 @@ import { resolveTokenLimit, type AutoCompactConfig } from "./config.ts";
 import { activeChildFrontier, activeTopBlocks } from "./mapping.ts";
 import {
 	SUMMARIZER_SYSTEM_PROMPT,
-	buildSummarizePrompt,
+	buildSummarizeParts,
 	cardTokensFor,
 	parseSummaryResponse,
 	rewriteInstruction,
 	summaryOutputTokenLimit,
 	validateSummary,
 } from "./summarizer.ts";
-import type { CompactBlock, PluginState, SummarizeInput } from "./types.ts";
-import { nextBlockId, renderBlockCard, serializeEntry, type TokenEstimator } from "./util.ts";
+import type { CompactBlock, PluginState, PromptPart, SummarizeInput } from "./types.ts";
+import { entryToPromptParts, nextBlockId, renderBlockCard, renderPromptParts, type TokenEstimator } from "./util.ts";
 
 export interface CompressProgress {
 	phase: "starting" | "compressing" | "completed" | "skipped" | "error";
@@ -37,10 +37,12 @@ export interface CompressDeps {
 	/** Active session system prompt; shown as read-only reference. */
 	systemPrompt: string;
 	estimate: TokenEstimator;
+	/** Whether the summary model accepts image input; otherwise images stay placeholders. */
+	supportsImages: boolean;
 	onProgress?: (progress: CompressProgress) => void;
-	summarizeFn: (prompt: string) => Promise<string>;
-	/** Per-operation memo of serialized entry text and its token estimate; filled lazily. */
-	entryCache?: Map<string, { text: string; tokens: number }>;
+	summarizeFn: (content: PromptPart[]) => Promise<string>;
+	/** Per-operation memo of an entry's prompt parts and the tokens its messages cost. */
+	entryCache?: Map<string, { parts: PromptPart[]; tokens: number }>;
 	/** Abort signal shared by every model request in this operation. */
 	signal?: AbortSignal;
 }
@@ -59,18 +61,18 @@ interface EntryIndex {
 }
 
 /** Serialize an entry once per operation; candidate searches reuse the same entries many times. */
-function cachedEntry(deps: CompressDeps, entry: SessionEntry): { text: string; tokens: number } {
+function cachedEntry(deps: CompressDeps, entry: SessionEntry): { parts: PromptPart[]; tokens: number } {
 	if (!deps.entryCache) deps.entryCache = new Map();
 	const cache = deps.entryCache;
 	const existing = cache.get(entry.id);
 	if (existing) return existing;
-	const text = serializeEntry(entry, true).text;
+	const parts = entryToPromptParts(entry, true, deps.supportsImages);
 	// Token accounting follows the message projection the model actually receives —
 	// images cost Pi's fixed per-image estimate, not the size of their base64 — while
-	// `text` stays the prompt payload. Entries that project no message cost nothing.
+	// the parts stay the prompt payload. Entries that project no message cost nothing.
 	const tokens = sessionEntryToContextMessages(entry)
 		.reduce((sum, message) => sum + deps.estimate(message), 0);
-	const value = { text, tokens };
+	const value = { parts, tokens };
 	cache.set(entry.id, value);
 	return value;
 }
@@ -95,7 +97,7 @@ function rangeTokens(index: EntryIndex, from: number, to: number): number {
 }
 
 interface ReferencePart {
-	text: string;
+	parts: PromptPart[];
 	region: "above" | "below";
 	order: number;
 	priority: number;
@@ -159,17 +161,22 @@ function estimateTextTokens(deps: CompressDeps, text: string): number {
 	return deps.estimate({ role: "user", content: text, timestamp: 0 } as AgentMessage);
 }
 
+/** Estimate prompt parts exactly as the provider will receive them, images included. */
+function estimatePartTokens(deps: CompressDeps, parts: PromptPart[]): number {
+	return deps.estimate({ role: "user", content: parts, timestamp: 0 } as AgentMessage);
+}
+
 /** Reserve enough room for the generated card and one structural rewrite. */
-function summaryRequestTokensForPrompt(deps: CompressDeps, prompt: string): number {
+function summaryRequestTokensForParts(deps: CompressDeps, parts: PromptPart[]): number {
 	return estimateTextTokens(deps, SUMMARIZER_SYSTEM_PROMPT)
-		+ estimateTextTokens(deps, prompt)
+		+ estimatePartTokens(deps, parts)
 		+ summaryOutputTokenLimit(deps.cfg.blockTokenCeiling)
 		+ SUMMARY_REWRITE_RESERVE;
 }
 
 /** Estimate the complete request that would be sent to the summary model. */
 function summaryRequestTokens(deps: CompressDeps, input: SummarizeInput): number {
-	return summaryRequestTokensForPrompt(deps, buildSummarizePrompt(input));
+	return summaryRequestTokensForParts(deps, buildSummarizeParts(input));
 }
 
 /** A cut point is immediately before the next user or assistant message. */
@@ -197,8 +204,9 @@ function collectReferenceParts(
 	const occupied = occupiedSourceIds(entries, state);
 	const parts: ReferencePart[] = [];
 
-	const add = (text: string, region: "above" | "below", order: number, priority: number, rank: number): void => {
-		if (text.trim()) parts.push({ text, region, order, priority, rank });
+	const add = (part: PromptPart[], region: "above" | "below", order: number, priority: number, rank: number): void => {
+		const hasContent = part.some((entry) => entry.type === "image") || renderPromptParts(part).trim().length > 0;
+		if (hasContent) parts.push({ parts: part, region, order, priority, rank });
 	};
 
 	for (const entry of visibleEntries) {
@@ -207,30 +215,36 @@ function collectReferenceParts(
 		if (excludedSourceIds.has(entry.id)) continue;
 		const block = byFirstSource.get(entry.id);
 		if (block) {
-			if (!excludedBlockIds.has(block.blockId)) add(renderBlockCard(block), "above", order, 1, order);
+			if (!excludedBlockIds.has(block.blockId)) add([{ type: "text", text: renderBlockCard(block) }], "above", order, 1, order);
 			continue;
 		}
 		if (occupied.has(entry.id)) continue;
 
 		const priority = 3;
 		const rank = order;
-		add(cachedEntry(deps, entry).text, "below", order, priority, rank);
+		add(cachedEntry(deps, entry).parts, "below", order, priority, rank);
 	}
 
 	if (deps.referenceContext.trim()) {
-		add(deps.referenceContext, "below", entries.length + 1, 0, 1);
+		add([{ type: "text", text: deps.referenceContext }], "below", entries.length + 1, 0, 1);
 	}
 	return parts;
 }
 
 /** Join selected reference fragments back into their original source order per region. */
-function joinReferenceParts(parts: ReferencePart[]): { above: string; below: string } {
+function joinReferenceParts(parts: ReferencePart[]): { above: PromptPart[]; below: PromptPart[] } {
 	const byRegion = { above: [] as ReferencePart[], below: [] as ReferencePart[] };
 	for (const part of parts) byRegion[part.region].push(part);
-	const join = (list: ReferencePart[]): string => [...list]
-		.sort((left, right) => left.order - right.order)
-		.map((part) => part.text)
-		.join("\n\n");
+	const join = (list: ReferencePart[]): PromptPart[] => {
+		const joined: PromptPart[] = [];
+		[...list]
+			.sort((left, right) => left.order - right.order)
+			.forEach((part, index) => {
+				if (index > 0) joined.push({ type: "text", text: "\n\n" });
+				joined.push(...part.parts);
+			});
+		return joined;
+	};
 	return { above: join(byRegion.above), below: join(byRegion.below) };
 }
 
@@ -240,9 +254,9 @@ function fitReferenceContext(
 	state: PluginState,
 	excludedSourceIds: Set<string>,
 	excludedBlockIds: Set<string>,
-	makeInput: (referenceAbove: string, referenceBelow: string) => SummarizeInput,
+	makeInput: (referenceAbove: PromptPart[], referenceBelow: PromptPart[]) => SummarizeInput,
 	boundReference = true,
-): { above: string; below: string; fits: boolean } {
+): { above: PromptPart[]; below: PromptPart[]; fits: boolean } {
 	const parts = collectReferenceParts(deps, state, excludedSourceIds, excludedBlockIds);
 	const complete = joinReferenceParts(parts);
 	if (!boundReference) {
@@ -254,9 +268,9 @@ function fitReferenceContext(
 		return { ...complete, fits: true };
 	}
 
-	const empty = makeInput("", "");
+	const empty = makeInput([], []);
 	const emptyTokens = summaryRequestTokens(deps, empty);
-	if (emptyTokens > deps.contextWindow) return { above: "", below: "", fits: false };
+	if (emptyTokens > deps.contextWindow) return { above: [], below: [], fits: false };
 
 	const available = deps.contextWindow - emptyTokens;
 	const ranked = [...parts].sort((left, right) =>
@@ -265,7 +279,7 @@ function fitReferenceContext(
 	const selected: ReferencePart[] = [];
 	let selectedTokens = 0;
 	for (const part of ranked) {
-		const partTokens = estimateTextTokens(deps, part.text) + 1;
+		const partTokens = estimatePartTokens(deps, part.parts) + 1;
 		if (selectedTokens + partTokens > available) continue;
 		selected.push(part);
 		selectedTokens += partTokens;
@@ -289,7 +303,7 @@ function prepareInput(
 	excludedBlockIds: Set<string>,
 	boundReference = true,
 ): PreparedInput {
-	const makeInput = (referenceAbove: string, referenceBelow: string): SummarizeInput => ({
+	const makeInput = (referenceAbove: PromptPart[], referenceBelow: PromptPart[]): SummarizeInput => ({
 		...base, systemPrompt: deps.systemPrompt, referenceAbove, referenceBelow,
 	});
 	const reference = fitReferenceContext(deps, state, excludedSourceIds, excludedBlockIds, makeInput, boundReference);
@@ -303,24 +317,24 @@ async function summarizeBlock(
 	input: SummarizeInput,
 ): Promise<{ block?: CompactBlock; error?: string }> {
 	throwIfAborted(deps);
-	const prompt = buildSummarizePrompt(input);
-	const firstRequestTokens = summaryRequestTokensForPrompt(deps, prompt);
+	const content = buildSummarizeParts(input);
+	const firstRequestTokens = summaryRequestTokensForParts(deps, content);
 	if (firstRequestTokens > deps.contextWindow) {
 		return { error: `summary request needs about ${firstRequestTokens} tokens, window is ${deps.contextWindow}` };
 	}
-	let response = (await deps.summarizeFn(prompt)).trim();
+	let response = (await deps.summarizeFn(content)).trim();
 	throwIfAborted(deps);
 	let parsed = parseSummaryResponse(response);
 	let cardTokens = cardTokensFor(state.nextSeq, input, parsed.summary, deps.estimate);
 	let validation = validateSummary(parsed.summary, cardTokens, input.budgetTokens);
 	let problems = [...parsed.problems, ...validation.problems];
 	if (problems.length > 0) {
-		const rewritePrompt = prompt + rewriteInstruction({ problems });
-		const rewriteRequestTokens = summaryRequestTokensForPrompt(deps, rewritePrompt);
+		const rewriteContent: PromptPart[] = [...content, { type: "text", text: rewriteInstruction({ problems }) }];
+		const rewriteRequestTokens = summaryRequestTokensForParts(deps, rewriteContent);
 		if (rewriteRequestTokens > deps.contextWindow) {
 			return { error: `summary rewrite needs about ${rewriteRequestTokens} tokens, window is ${deps.contextWindow}` };
 		}
-		response = (await deps.summarizeFn(rewritePrompt)).trim();
+		response = (await deps.summarizeFn(rewriteContent)).trim();
 		throwIfAborted(deps);
 		parsed = parseSummaryResponse(response);
 		cardTokens = cardTokensFor(state.nextSeq, input, parsed.summary, deps.estimate);
@@ -431,7 +445,7 @@ async function promoteGroup(
 	const sourceEntryIds = [checked[0].startEntryId, checked.at(-1)?.endEntryId ?? checked[0].endEntryId];
 	const sourceTokens = checked.reduce((sum, block) => sum + block.sourceTokens, 0);
 	const base: Omit<SummarizeInput, "systemPrompt" | "referenceAbove" | "referenceBelow"> = {
-		targetRange: checked.map((block) => `[${block.blockId} level ${block.level}]\n${block.summary}`).join("\n\n"),
+		targetParts: [{ type: "text", text: checked.map((block) => `[${block.blockId} level ${block.level}]\n${block.summary}`).join("\n\n") }],
 		sourceEntryIds,
 		sourceTokens,
 		level: Math.max(...checked.map((block) => block.level)) + 1,
@@ -685,8 +699,13 @@ function canExtendThroughProtectedToolResult(
 }
 
 /** Serialize the target range through the per-operation entry cache. */
-function serializeRangeCached(deps: CompressDeps, entries: SessionEntry[]): string {
-	return entries.map((entry) => cachedEntry(deps, entry).text).join("\n\n");
+function serializeRangeCached(deps: CompressDeps, entries: SessionEntry[]): PromptPart[] {
+	const parts: PromptPart[] = [];
+	entries.forEach((entry, index) => {
+		if (index > 0) parts.push({ type: "text", text: "\n\n" });
+		parts.push(...cachedEntry(deps, entry).parts);
+	});
+	return parts;
 }
 
 /** Select the largest range ending immediately before a user or assistant message. */
@@ -722,7 +741,7 @@ function findAutoCandidate(
 		const sourceEntryIds = targetEntries.map((entry) => entry.id);
 		const sourceTokens = rangeTokens(index, run.from, end);
 		const base: Omit<SummarizeInput, "systemPrompt" | "referenceAbove" | "referenceBelow"> = {
-			targetRange: serializeRangeCached(deps, targetEntries),
+			targetParts: serializeRangeCached(deps, targetEntries),
 			sourceEntryIds,
 			sourceTokens,
 			level: 1,
@@ -765,7 +784,7 @@ async function createLevelOne(
 	const sourceEntryIds = entries.map((entry) => entry.id);
 	const sourceTokens = rangeTokens(index, from, to);
 	const base: Omit<SummarizeInput, "systemPrompt" | "referenceAbove" | "referenceBelow"> = {
-		targetRange: serializeRangeCached(deps, entries),
+		targetParts: serializeRangeCached(deps, entries),
 		sourceEntryIds,
 		sourceTokens,
 		level: 1,
