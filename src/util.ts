@@ -20,6 +20,14 @@ export function messageToText(message: AgentMessage, includeThinking = true): st
 	return "";
 }
 
+/** Describe an image without its payload; base64 is not text and must never reach a prompt. */
+function imageToText(block: Record<string, unknown>): string {
+	const mime = typeof block.mimeType === "string" ? block.mimeType : "unknown";
+	const data = typeof block.data === "string" ? block.data : "";
+	if (!data) return `[image ${mime}]`;
+	return `[image ${mime}, about ${Math.max(1, Math.round((data.length * 3) / 4 / 1024))}KB omitted]`;
+}
+
 /** Preserve all text/tool/image fields; thinking can be hidden for normal retrieval. */
 function contentToText(content: unknown, includeThinking: boolean): string {
 	if (typeof content === "string") return content;
@@ -38,7 +46,7 @@ function contentToText(content: unknown, includeThinking: boolean): string {
 		} else if (b.type === "toolCall") {
 			parts.push(`[tool_call]\n${String(b.name ?? "") }(${JSON.stringify(b.arguments)})`);
 		} else if (b.type === "image") {
-			parts.push(`[image]\n${JSON.stringify(b)}`);
+			parts.push(imageToText(b));
 		} else parts.push(JSON.stringify(b));
 	}
 	return parts.join("\n");

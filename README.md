@@ -166,6 +166,8 @@ pi -e /home/xenon/pi-auto-compact
 
 上述三部分互不重叠，共同覆盖摘要所需当前投影。对于已经超过模型窗口的会话，插件按完整 entry 或完整块卡片缩小参考区；原始完整内容仍保留在 session JSONL 中。
 
+图片以 `[image <mime>, about <大小>KB omitted]` 占位符进入 `target_compaction_range`、参考区与 `context_get` 文本，base64 不进入任何提示词；需要原始数据时用 `context_get` 的 `rawEntryJson`。entry 的 token 记账（`sourceTokens`、受保护尾部、净收益、进度）按 Pi 的消息投影计算，图片按 Pi 的固定每图估算计费；摘要请求能否发出仍以实际提示词文本为准。
+
 范围选择与请求发送共同使用 `max(2 * blockTokenCeiling, 2048)` 作为输出预留；实际请求还受模型输出上限约束。思考与摘要合计不能超过这一上限；范围选择额外预留 Pi 适配器的 4096 token 输入余量和 256 token 重写余量。level-1 因净收益要求而缩小卡片预算时，不会错误地同步缩小请求输出预留。模型达到输出上限而未正常结束时，仍拒绝提交，不硬截断摘要。
 
 摘要采用固定输出协议：模型先生成不超过 50 字符的一句话概述，供 `/auto-compact-blocks` 的树视图显示；随后生成 `<progress>`（含 `<done>`、`<doing>`、`<todo>`）、`<blocked>`、`<decision>`、`<critical_content>`、`<read_files>`、`<modified_files>` 组成的详细压缩块。两者在同一次模型请求中生成，概述只写入块元数据，不进入投影给模型的块卡片。level-1 完整卡片预算同时受 `blockTokenCeiling` 和 `minNetGainTokens` 约束，确保生成结果达到最低净收益；第一次输出不合格时重写一次，仍不合格则整次操作回滚。插件不会硬截断摘要。

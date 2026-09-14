@@ -21,6 +21,7 @@ npm pack --dry-run
 - `blockMergeThreshold = k` 表示出现第 `k + 1` 个连续同级块后合并最旧 `k` 个。
 - 摘要、全部连锁提升和 sidecar 写入成功后才能替换内存状态。
 - 摘要通过当前注册提供方的 `streamSimple` 继承 `ctx.thinkingLevel`，认证、请求构造与压缩状态机分离；使用 Pi 的 `retryAssistantCall` 和受信任设置中的重试策略，不另写错误分类或双层重试。请求及重试等待共用操作取消信号，终止摘要与未完成输出不得提交。
+- 摘要提示词、参考区与 `context_get` 文本用占位符描述图片，绝不把 base64 当文本；entry token 记账走 Pi 的消息投影（`sessionEntryToContextMessages` + `estimateTokens`），摘要请求预算按实际提示词文本估算。
 - 摘要选段预算与实际请求共用 `summaryOutputTokenLimit`；较小的 level-1 卡片预算不能缩小真实输出预留。提供方附加的思考预算必须纳入输出上限，输入预算保留 Pi 适配器余量。调试日志记录模型、有效思考等级、token 估算、尝试次数、耗时和错误，不主动记录提示词、正文或认证信息。
 - `REFERENCE_CONTEXT` 与 `TARGET_RANGE` 不重复，二者合起来覆盖摘要所需当前上下文。
 - 压缩块禁止 `Goal`，完整卡片不得超过 `blockTokenCeiling`，摘要不得硬截断。

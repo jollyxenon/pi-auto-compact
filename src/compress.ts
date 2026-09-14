@@ -65,7 +65,11 @@ function cachedEntry(deps: CompressDeps, entry: SessionEntry): { text: string; t
 	const existing = cache.get(entry.id);
 	if (existing) return existing;
 	const text = serializeEntry(entry, true).text;
-	const tokens = deps.estimate({ role: "user", content: text, timestamp: 0 } as AgentMessage);
+	// Token accounting follows the message projection the model actually receives —
+	// images cost Pi's fixed per-image estimate, not the size of their base64 — while
+	// `text` stays the prompt payload. Entries that project no message cost nothing.
+	const tokens = sessionEntryToContextMessages(entry)
+		.reduce((sum, message) => sum + deps.estimate(message), 0);
 	const value = { text, tokens };
 	cache.set(entry.id, value);
 	return value;
