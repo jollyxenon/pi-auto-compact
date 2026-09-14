@@ -12,7 +12,6 @@ import type { CompactBlock, PluginState } from "./types.ts";
 
 export interface ProjectedContextUsage {
 	tokens: number;
-	contextWindow: number;
 }
 
 const COMPRESSION_STATUS_KEY = "auto-compact-progress";
@@ -81,7 +80,7 @@ export function installAutoCompactFooter(
 
 					const projected = getProjectedUsage();
 					const native = ctx.getContextUsage();
-					const contextWindow = projected?.contextWindow ?? native?.contextWindow ?? ctx.model?.contextWindow ?? 0;
+					const contextWindow = ctx.model?.contextWindow ?? native?.contextWindow ?? 0;
 					const contextTokens = projected?.tokens ?? native?.tokens ?? null;
 					const percent = contextTokens === null || contextWindow <= 0 ? "?" : ((contextTokens / contextWindow) * 100).toFixed(1);
 					const contextDisplay = percent === "?" ? "?" : `${percent}%`;

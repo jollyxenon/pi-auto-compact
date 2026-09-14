@@ -217,7 +217,7 @@ export default function autoCompactExtension(pi: ExtensionAPI) {
 		const visible = ctx.sessionManager.buildContextEntries();
 		const rawMessages = messages ?? buildSessionContext(visible).messages;
 		const mapping = buildMapping(visible, rawMessages);
-		const contextWindow = ctx.getContextUsage()?.contextWindow ?? ctx.model?.contextWindow ?? 0;
+		const contextWindow = ctx.model?.contextWindow ?? ctx.getContextUsage()?.contextWindow ?? 0;
 		if (contextWindow <= 0) {
 			projectedUsage = undefined;
 			renderFooter();
@@ -238,10 +238,7 @@ export default function autoCompactExtension(pi: ExtensionAPI) {
 				: rawEstimate;
 			updateOverhead(blocks, nativeTokens, mappedRawEstimate);
 		}
-		projectedUsage = {
-			tokens: contextOverhead + projectedEstimate,
-			contextWindow,
-		};
+		projectedUsage = { tokens: contextOverhead + projectedEstimate };
 		renderFooter();
 	}
 
@@ -670,7 +667,7 @@ export default function autoCompactExtension(pi: ExtensionAPI) {
 		if (usageTokens !== undefined && usageTokens !== null) {
 			updateOverhead(blocks, usageTokens, mappedRawEstimate);
 		}
-		projectedUsage = { tokens: contextOverhead + projectedEstimate, contextWindow: window };
+		projectedUsage = { tokens: contextOverhead + projectedEstimate };
 		renderFooter();
 		const projectedTokens = projectedUsage.tokens;
 		const trigger = resolveTokenLimit(cfg.trigger, window);
@@ -701,7 +698,6 @@ export default function autoCompactExtension(pi: ExtensionAPI) {
 			const refreshedProjected = projectMessages(event.messages, refreshedMapping, activeTopBlocks(refreshedVisible, state));
 			projectedUsage = {
 				tokens: contextOverhead + refreshedProjected.reduce((sum, message) => sum + estimateTokens(message), 0),
-				contextWindow: window,
 			};
 			renderFooter();
 			return { messages: refreshedProjected };
