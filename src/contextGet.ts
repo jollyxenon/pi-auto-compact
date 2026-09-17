@@ -89,6 +89,7 @@ export function paginateEntryTexts(
 }
 
 export function makeContextGetTool(deps: ContextGetDeps) {
+	// 全部参数可选时仍显式发送空数组，避免网关把缺失的 required 转成 null。
 	const parameters = Type.Object({
 		blockId: Type.Optional(Type.String({ description: "Historical block ID" })),
 		startId: Type.Optional(Type.String({ description: "First Pi session entry ID" })),
@@ -97,7 +98,7 @@ export function makeContextGetTool(deps: ContextGetDeps) {
 		includeThinking: Type.Optional(Type.Boolean({ description: "Include archived assistant thinking; default false" })),
 		rawEntryJson: Type.Optional(Type.Boolean({ description: "Return every complete Pi SessionEntry field as JSON; default false" })),
 		maxTokens: Type.Optional(Type.Integer({ minimum: 256, description: "Page token limit; capped by the effective maxPageSize" })),
-	});
+	}, { required: [] });
 	return {
 		name: "context_get",
 		label: "读取压缩历史原文",
