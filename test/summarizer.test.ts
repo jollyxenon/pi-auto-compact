@@ -1,6 +1,5 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { resolveTokenLimit } from "../src/config.ts";
 import { buildSummarizeParts, validateSummary } from "../src/summarizer.ts";
 import type { SummarizeInput } from "../src/types.ts";
 import { renderPromptParts } from "../src/util.ts";
@@ -75,9 +74,4 @@ test("summary validation rejects Goal and the complete-card token overflow", () 
 	assert.equal(preface.ok, false);
 	const overflow = validateSummary(valid, 501, 500);
 	assert.equal(overflow.overBudget, true);
-});
-
-test("token limits support absolute tokens and percentages", () => {
-	assert.equal(resolveTokenLimit({ mode: "tokens", value: 1234.9 }, 10_000), 1234);
-	assert.equal(resolveTokenLimit({ mode: "percent", value: 0.8 }, 10_000), 8000);
 });

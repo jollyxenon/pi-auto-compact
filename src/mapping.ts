@@ -41,26 +41,38 @@ export function buildMapping(visibleEntries: SessionEntry[], messages: AgentMess
 	};
 }
 
+/** Locate the stored branch anchor for the current path, or null when no branch index exists.
+ * The root frontier, child frontier, and retained pointer are written under the same anchor,
+ * so resolving the anchor once keeps selection, projection, and display consistent. */
+function branchAnchorFor(entries: SessionEntry[], state: PluginState): string | null {
+	const byBranch = state.topLevelBlockIdsByBranch;
+	if (!byBranch || Object.keys(byBranch).length === 0) return null;
+	for (let index = entries.length - 1; index >= 0; index--) {
+		const key = entries[index]?.id ?? "";
+		if (byBranch[key]) return key;
+	}
+	return "__root__";
+}
+
 /** Return the stored frontier for the current path, or null when no stored key matches. */
 function frontierIdsForEntries(entries: SessionEntry[], state: PluginState): string[] | null {
-	const byBranch = state.topLevelBlockIdsByBranch;
-	if (!byBranch || Object.keys(byBranch).length === 0) return state.topLevelBlockIds;
-	for (let index = entries.length - 1; index >= 0; index--) {
-		const ids = byBranch[entries[index]?.id ?? ""];
-		if (ids) return ids;
-	}
-	return byBranch.__root__ ?? null;
+	const anchor = branchAnchorFor(entries, state);
+	if (anchor === null) return state.topLevelBlockIds;
+	return state.topLevelBlockIdsByBranch?.[anchor] ?? null;
 }
 
 /** Return the internal edge selection stored for the current branch. */
 export function activeChildFrontier(entries: SessionEntry[], state: PluginState): Record<string, string[]> {
-	const byBranch = state.childBlockIdsByParentByBranch;
-	if (!byBranch || Object.keys(byBranch).length === 0) return state.childBlockIdsByParent;
-	for (let index = entries.length - 1; index >= 0; index--) {
-		const frontier = byBranch[entries[index]?.id ?? ""];
-		if (frontier) return frontier;
-	}
-	return byBranch.__root__ ?? {};
+	const anchor = branchAnchorFor(entries, state);
+	if (anchor === null) return state.childBlockIdsByParent;
+	return state.childBlockIdsByParentByBranch?.[anchor] ?? {};
+}
+
+/** First entry after the compacted prefix, resolved from the same anchor as the block frontier. */
+export function activeFirstKeptEntryId(entries: SessionEntry[], state: PluginState): string | undefined {
+	const anchor = branchAnchorFor(entries, state);
+	if (anchor === null) return state.firstKeptEntryIdByBranch?.__root__;
+	return state.firstKeptEntryIdByBranch?.[anchor];
 }
 
 interface EntrySpan {
@@ -108,6 +120,11 @@ export function activeTopBlocks(entries: SessionEntry[], state: PluginState): Co
 	return active.sort((left, right) => left.start - right.start).map(({ block }) => block);
 }
 
+/** System messages are Pi prompt state, not conversation; block projection must keep them. */
+function promptStateMessages(entry: SessionEntry): AgentMessage[] {
+	return sessionEntryToContextMessages(entry).filter((message) => message.role === "system");
+}
+
 /** Replace compact intervals with cards and keep their entire envelope free of raw entries. */
 export function projectSessionEntries(visibleEntries: SessionEntry[], blocks: CompactBlock[]): AgentMessage[] {
 	const positions = new Map(visibleEntries.map((entry, index) => [entry.id, index] as const));
@@ -123,10 +140,14 @@ export function projectSessionEntries(visibleEntries: SessionEntry[], blocks: Co
 		const span = byStart.get(index);
 		if (span) {
 			messages.push({ role: "user", content: renderBlockCard(span.block), timestamp: Date.now() });
+			for (let inner = index; inner <= span.end; inner++) messages.push(...promptStateMessages(visibleEntries[inner]));
 			index = span.end;
 			continue;
 		}
-		if (envelopeStart !== undefined && envelopeEnd !== undefined && envelopeStart <= index && index <= envelopeEnd) continue;
+		if (envelopeStart !== undefined && envelopeEnd !== undefined && envelopeStart <= index && index <= envelopeEnd) {
+			messages.push(...promptStateMessages(visibleEntries[index]));
+			continue;
+		}
 		messages.push(...sessionEntryToContextMessages(visibleEntries[index]));
 	}
 	return messages;
@@ -189,10 +210,16 @@ export function projectMessages(
 		const span = byStart.get(index);
 		if (span) {
 			output.push({ role: "user", content: renderBlockCard(span.block), timestamp: Date.now() });
+			for (let inner = index; inner <= span.end; inner++) {
+				if (messages[inner].role === "system") output.push(messages[inner]);
+			}
 			index = span.end;
 			continue;
 		}
-		if (envelopeStart !== undefined && envelopeEnd !== undefined && envelopeStart <= index && index <= envelopeEnd) continue;
+		if (envelopeStart !== undefined && envelopeEnd !== undefined && envelopeStart <= index && index <= envelopeEnd) {
+			if (messages[index].role === "system") output.push(messages[index]);
+			continue;
+		}
 		output.push(messages[index]);
 	}
 	return output;

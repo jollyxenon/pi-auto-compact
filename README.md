@@ -5,20 +5,24 @@
 ## 行为
 
 - 在工具调用后的下一次模型请求前自动压缩，不中止正在执行的工具；可在 `/auto-compact-config` 中关闭自动压缩。
-- 安装并加载后，通过 `session_before_compact` 取消 Pi 原生压缩，不修改 `settings.json`。插件始终接管手动、threshold 和 overflow 压缩，即使插件压缩失败或没有可提交状态也取消原生行为，不回退到原生 compact。
-- 第一次压缩生成 level 1 块；`/auto-compact` 会在一次原子操作中反复处理当前可见上下文中所有尚未压缩、且位于受保护尾部之前的完整区间。
+- 安装并加载后，通过 `session_before_compact` 取消 Pi 原生压缩，不修改 `settings.json`。插件安装期间始终接管手动、threshold 和 overflow 压缩，即使插件压缩失败或没有可提交状态也取消原生行为，不回退到原生 compact；关闭自动压缩只停止插件的自动扫描，不放行原生压缩。
+- 压缩只沿一条连续前缀推进：第一次从当前可见上下文的第一条参与 LLM context 的非 `system` 消息开始，之后从保留指针开始，绝不跳过中间未压缩内容；发现前部存在未压缩对话空隙时报告原因并保留原文，不以最后一个块尾作为前缀终点。前导的 `system` prompt state 与纯元数据 entry 可以留在前缀之外。
+- 触发与保留窗口沿用 Pi 原生压缩的 token 模型：`reserveTokens` 与 `keepRecentTokens` 都是绝对值。`context` 事件用 Pi 的 `shouldCompact` 判断（`contextTokens > window - reserveTokens`），保留段起点直接用 Pi 的 `findCutPoint`，两者都按 Pi 的 `estimateTokens` 计量，避免 provider 口径与 chars/4 口径混用。
 - `blockMergeThreshold = k` 时，同一连续层级出现第 `k + 1` 个块后，最旧的 `k` 个块提升为一个更高层块。
 - 高层块只引用直接子块；每个块只记录原始范围的首尾 Entry ID，不保存或核验中间 Entry ID 序列；低层块和原始 session entry 不删除。
 - 块的首尾可以是不产生模型消息的 `custom` 等 entry。投影按完整 entry 区间定位其中实际存在的消息，不要求首尾 ID 直接对应模型消息；已有块无需重新摘要即可生效。
-- 当前活动顶层块从第一个块头到最后一个块尾形成纯净压缩区。该区域只投影块卡片；其他扩展后来插入块内部或块间的消息会直接丢弃，不后移，也不进入摘要参考。压缩区之外的注入消息照常保留。
-- `maxBlocks` 只约束一次操作完成后的稳定顶层投影；生成、连锁提升和持久化作为一次原子操作。
+- sidecar 是唯一有效状态：块仓库、当前分支前沿和保留指针（`firstKeptEntryIdByBranch`）都保存在其中。每次有效状态变化后，插件在对话末尾追加一条仅供展示的 `custom` entry（`auto-compact-snapshot`），记录当次全部顶层块卡片和保留起点；这条记录不进入模型上下文，也不用于恢复块树或覆盖状态。发送的卡片与保留指针都没变时不重复追加，仅调整块树内部结构也不会重新发一份相同摘要。
+- 插件只借鉴 Pi 的“摘要 + 指针”思路，不调用 `ctx.compact()`、不生成原生 `CompactionEntry`，也不通过原生钩子发布摘要。已有原生压缩历史不在本次接管范围：未被插件块覆盖的原生摘要会继续保留，不做全局删除。
+- 模型每次只收到一份当前顶层块卡片加保留原文，展示快照无论新旧都不会出现在发送内容、摘要目标或参考材料中。
+- 当前活动顶层块从第一个块头到最后一个块尾形成压缩区。该区域只投影块卡片；其他扩展后来插入块内部或块间的普通消息会直接丢弃，不后移，也不进入摘要参考。但 `role: "system"` 的 prompt state 始终原样保留在投影里（Pi 用 compaction entry 回放系统提示词，插件只能保留原文）。压缩区之外的注入消息照常保留。
+- 恢复已有会话时，`/auto-compact` 会用同一分支的保留指针继续：先压缩最早能放入摘要请求的完整区间，生成的块随后作为参考上下文继续处理后续区间，直到保护尾部之前没有未压缩内容。已经由块表示的旧前缀不会重新摘要，已经追加的展示快照既不作为目标范围也不进入参考区。
 - 所有自动与手动压缩操作都会在编辑器上方显示实时 token 进度条；操作结束后原位置显示“压缩完成”和最新压缩块 ID、层级。失败时保留失败状态和已完成进度。
-- 插件接管 Pi footer 的上下文占用字段，按实际发送给模型的压缩后投影重新计算 `xx%/context_limit`；切换模型后，百分比与窗口上限立即按当前模型更新，不沿用投影缓存中的旧窗口。累计 token、费用、目录、分支和模型信息仍保留。
-- 自动压缩从当前可见 session context 中第一条参与 LLM context 的消息开始；系统提示词、AGENTS.md、工具描述和 Skill 描述由 Pi 单独管理，不属于 session entry。主会话系统提示词会作为只读参考传给摘要模型。摘要校验仍拒绝 `Goal`。
-- 最近上下文由 `keepRecent` 保护，自动压缩不会触碰当前未完成尾部。
+- 插件接管 Pi footer 的上下文占用字段，按 Pi 的口径估算当前投影：优先信任最后一条 assistant usage，只对之后的消息追加 `estimateTokens`；出现 `context_edit` 或已提交的展示快照时该锚点失效，改为对投影整体估算。切换模型后，百分比与窗口上限立即按当前模型更新。累计 token、费用、目录、分支和模型信息仍保留。
+- `maxBlocks` 只约束一次操作完成后的稳定顶层投影；生成、连锁提升和持久化作为一次原子操作。
+- 最近对话由绝对量 `keepRecentTokens` 保护，自动压缩不会触碰当前未完成尾部；保留段起点与 Pi 原生压缩一致。
 - 摘要使用当前会话模型和有效思考等级，通过 Pi 已注册提供方的 `streamSimple` 构造请求；不会因省略参数而把主对话的 `high` 等等级变成关闭思考。摘要仍是独立请求，保留 `cacheRetention: "none"`，不调用主对话的请求修改事件。
 - 摘要沿用 Pi `settings.json` 的 `retry.enabled`、`retry.maxRetries` 和 `retry.baseDelayMs`，默认对临时连接、限流和服务端错误最多重试 3 次，间隔为 2、4、8 秒；重试前显示通知。使用 Pi 的错误分类，不对笼统的 400、鉴权或额度耗尽错误盲目重试。只在完整请求层重试，底层 SDK 重试次数固定为 0，避免两层重试相乘。
-- 恢复已有会话时，`/auto-compact` 会从当前可见上下文的第一条可转换消息重新扫描，并模拟沿 context 前进的过程：先压缩最早能放入摘要请求的完整区间，生成的块随后作为参考上下文继续处理后续区间，直到保护尾部之前没有未压缩内容。Pi 原生 `compaction` 不会作为目标范围，也不会进入参考区。
+- 自动压缩从当前可见 session context 中的保留指针开始；系统提示词、AGENTS.md、工具描述和 Skill 描述由 Pi 单独管理，不属于 session entry。主会话系统提示词会作为只读参考传给摘要模型。摘要校验仍拒绝 `Goal`。
 
 ## 安装
 
@@ -55,8 +59,8 @@ pi -e /home/xenon/pi-auto-compact
 ```json
 {
   "enabled": true,
-  "trigger": { "mode": "percent", "value": 0.85 },
-  "keepRecent": { "mode": "tokens", "value": 20000 },
+  "reserveTokens": 16384,
+  "keepRecentTokens": 20000,
   "blockTokenCeiling": 2000,
   "blockMergeThreshold": 3,
   "maxBlocks": { "enabled": true, "value": 4 },
@@ -67,27 +71,17 @@ pi -e /home/xenon/pi-auto-compact
 }
 ```
 
-`trigger` 和 `keepRecent` 均支持：
+`reserveTokens` 和 `keepRecentTokens` 与 Pi 原生压缩的设置同名同义，都是绝对值，默认值取自 Pi 的 `DEFAULT_COMPACTION_SETTINGS`（16384 / 20000）：前者表示“窗口剩余多少 token 时开始压缩”，后者表示“最近多少 token 的对话保持原文”。两者都按 Pi 的 `estimateTokens` 计量，不再有百分比模式。
 
-```json
-{ "mode": "tokens", "value": 80000 }
-```
-
-或：
-
-```json
-{ "mode": "percent", "value": 0.8 }
-```
-
-配置加载时校验，无效值直接报错：`blockTokenCeiling`、`defaultPageSize`、`maxPageSize`、`minNetGainTokens`、`blockMergeThreshold` 和 `maxBlocks.value` 必须是正整数；`enabled`、`maxBlocks.enabled`、`debug` 必须是布尔值；`trigger` 与 `keepRecent` 单位相同时，`keepRecent.value` 必须小于 `trigger.value`。项目配置里的 `maxBlocks` 按字段合并：只写 `{ "value": 8 }` 不会丢失全局的 `enabled`。
+配置加载时校验，无效值直接报错：`reserveTokens`、`keepRecentTokens`、`blockTokenCeiling`、`defaultPageSize`、`maxPageSize`、`blockMergeThreshold` 和 `maxBlocks.value` 必须是正整数；`enabled`、`maxBlocks.enabled`、`debug` 必须是布尔值。项目配置里的 `maxBlocks` 按字段合并：只写 `{ "value": 8 }` 不会丢失全局的 `enabled`。
 
 修改配置后执行 `/auto-compact-config`，插件会打开键盘交互设置面板。关闭 `自动压缩` 后，插件不再响应上下文阈值和溢出事件；已有压缩块仍会继续投影，`/auto-compact`、`compact_context` 和 `adjust_context_blocks` 等手动操作仍可用。使用上下键移动；单位、开关等选项用空格或 Tab 切换；数值可以用 Tab 在预设之间切换，也可以直接输入数字；自定义数字不会加入预设，下一次按 Tab 会回到预设值。Enter 或 Ctrl+S 保存全部修改，Ctrl+C 或 Esc 退出且不保存。启用 `debug` 后，插件会把运行时会话切换、上下文投影、压缩进度和结果写入 Pi 的 `~/.pi/agent/pi-debug.log`；关闭时不写入这些日志。
 
 ## 输入框命令
 
-- `/auto-compact`：从当前可见上下文的第一条参与 LLM context 的消息重新扫描，把受保护尾部之前所有尚未压缩的完整区间逐块处理；已有压缩块会先参与稳定和升层。完整操作成功后才提交状态。
+- `/auto-compact`：从当前分支的保留指针继续，把受保护尾部之前所有尚未压缩的完整区间逐块处理；已有压缩块会先参与稳定和升层。完整操作成功后才替换内存状态并追加展示快照。
 - `/auto-compact-blocks`：以当前活动分支的顶层块为根，交互式展示当前使用的完整压缩块树。每个块显示 ID、层级和生成时保存的一句话概述；使用上下键浏览、左右键折叠或展开、Enter 打开操作、Esc 退出。可拆开任意可见高层块，让它当前选中的子块在原父节点下就地展开；也可把同一父节点下连续、同级的兄弟块合并。level-1 是固定叶子，不在树编辑器中继续拆分。高层节点由它覆盖的有序 level-1 叶子序列识别：只改内部树边不会重做祖先摘要；再次组合出已有叶子序列时直接复用仓库中的旧块，不调用摘要模型。
-- `/auto-compact-config`：交互式调整 auto-compact 配置。`自动压缩` 控制是否响应上下文阈值和溢出事件；关闭后仍可使用手动压缩命令和工具。百分比/绝对值与对应数值是分开的设置项；空格或 Tab 切换单位、开关和预设值，直接输入可填写自定义数值，Enter/Ctrl+S 保存，Ctrl+C/Esc 取消。`运行时调试日志` 控制是否写入 Pi 的 `~/.pi/agent/pi-debug.log`。
+- `/auto-compact-config`：交互式调整 auto-compact 配置。`自动压缩` 控制是否响应上下文阈值和溢出事件；关闭后仍可使用手动压缩命令和工具。`触发前预留 token` 与 `保留最近 token` 都是可直接输入的数字，空格或 Tab 切换开关和预设值，Enter/Ctrl+S 保存，Ctrl+C/Esc 取消。`运行时调试日志` 控制是否写入 Pi 的 `~/.pi/agent/pi-debug.log`。
 
 ## 工具
 
@@ -103,7 +97,7 @@ pi -e /home/xenon/pi-auto-compact
 }
 ```
 
-范围不能包含已有顶层块或当前未完成尾部。
+`startId` 必须是当前分支保留指针所在的第一条未压缩对话 entry；跳过更早的未压缩原文、包含已有顶层块或触碰当前未完成尾部的范围都会被拒绝，并提示应使用的起点。前导只产生 prompt state 或元数据的 entry 可以显式指定。
 
 ### `adjust_context_blocks`
 
@@ -156,6 +150,8 @@ pi -e /home/xenon/pi-auto-compact
 
 也可以使用 `startId` 与 `endId` 精确读取当前活动分支中的 entry 区间。
 
+工具 schema 显式保留 `required: []`：各参数仍为可选，由工具校验上述查询组合；避免网关将缺失的 `required` 转成 `null` 后报 `Invalid schema for function 'context_get'`。
+
 ## 摘要边界
 
 每次摘要请求分为两个互不重复的区域，二者在请求预算允许时合起来覆盖摘要所需的当前投影：
@@ -166,7 +162,7 @@ pi -e /home/xenon/pi-auto-compact
 
 上述三部分互不重叠，共同覆盖摘要所需当前投影。对于已经超过模型窗口的会话，插件按完整 entry 或完整块卡片缩小参考区；原始完整内容仍保留在 session JSONL 中。
 
-图片在摘要请求里按原始位置以图片块发送，因此按图片计费而不是按 base64 计费；只有当前模型不支持图片输入时才退化为 `[image <mime>, about <大小>KB omitted]` 占位符。`context_get` 的文本形式始终用占位符，原始数据用 `rawEntryJson`。entry 的 token 记账（`sourceTokens`、受保护尾部、净收益、进度）按 Pi 的消息投影计算，图片按 Pi 的固定每图估算计费；摘要请求预算按实际提示词内容（含图片块）估算，因此估算与实发一致。
+图片在摘要请求里按原始位置以图片块发送，因此按图片计费而不是按 base64 计费；只有当前模型不支持图片输入时才退化为 `[image <mime>, about <大小>KB omitted]` 占位符。`context_get` 的文本形式始终用占位符，原始数据用 `rawEntryJson`。不产生模型消息的 entry（例如其他扩展写入的 `custom` 展示记录、`model_change`、`thinking_level_change`）不是摘要素材：它们仍留在块的头尾区间内，`context_get` 照样能按区间取回，但正文 JSON 不出现在目标区或参考区——这些记录 Pi 在正常对话里也不会发给模型。entry 的 token 记账（`sourceTokens`、受保护尾部、净收益、进度）按 Pi 的消息投影计算，图片按 Pi 的固定每图估算计费；摘要请求预算按实际提示词内容（含图片块）估算，且对中文等 CJK 文字和密集代码/JSON 采用偏保守的每字口径（CJK 约每字一 token，其余约每三字符一 token）。两者口径不同是刻意的：窗口校验宁可高估请求。这是启发式近似，不保证与提供方分词器完全一致，但可以避免 chars/4 在中文/代码内容上把超窗请求当成“放得下”。
 
 范围选择与请求发送共同使用 `max(2 * blockTokenCeiling, 2048)` 作为输出预留；实际请求还受模型输出上限约束。思考与摘要合计不能超过这一上限；范围选择额外预留 Pi 适配器的 4096 token 输入余量和 256 token 重写余量。level-1 因净收益要求而缩小卡片预算时，不会错误地同步缩小请求输出预留。模型达到输出上限而未正常结束时，仍拒绝提交，不硬截断摘要。
 
@@ -180,9 +176,11 @@ pi -e /home/xenon/pi-auto-compact
 <session>.autocompact.json
 ```
 
-原始消息仍在 Pi 的 append-only session JSONL 中。当前 sidecar schema 为 4；块只持久化 `startEntryId` 和 `endEntryId`，`context_get` 在当前活动分支上按这两个边界动态读取完整区间。旧 schema 升级后会按无效旧结构隔离为 `.corrupt-<时间戳>`，再从空状态重建。sidecar 使用临时文件加 rename 写入；同时按活动路径保存顶层前沿和每个父节点当前选中的子前沿，切换分支时不会让其他分支参与当前投影或树结构。写入、摘要或任一级提升失败时，当前内存投影保持不变。sidecar 不存在时正常使用空状态，不报警；权限等其他读取错误会明确报错并中止本次加载，不隔离原文件。sidecar 无法解析或结构校验失败（缺少字段、块 ID 重复、子块引用不存在、序号回退）时，原文件重命名为 `<session>.autocompact.json.corrupt-<时间戳>` 留存排查，插件从空状态重建。
+原始消息仍在 Pi 的 append-only session JSONL 中。当前 sidecar schema 为 4；块只持久化 `startEntryId` 和 `endEntryId`，`context_get` 在当前活动分支上按这两个边界动态读取完整区间。旧 schema 升级后会按无效旧结构隔离为 `.corrupt-<时间戳>`，再从空状态重建。sidecar 使用临时文件加 rename 写入；同时按同一活动路径键保存顶层前沿、每个父节点当前选中的子前沿和保留指针（`firstKeptEntryIdByBranch`），切换分支时不会让其他分支参与当前投影或树结构。写入、摘要或任一级提升失败时，当前内存投影保持不变。sidecar 不存在时正常使用空状态，不报警；权限等其他读取错误会明确报错并中止本次加载，不隔离原文件。sidecar 无法解析或结构校验失败（缺少字段、块 ID 重复、子块引用不存在、序号回退）时，原文件重命名为 `<session>.autocompact.json.corrupt-<时间戳>` 留存排查，插件从空状态重建。保留指针只校验字符串结构，路径与覆盖关系在选块时校验；旧 sidecar 没有该字段时按当前块边界直接推导，不算损坏。
 
-插件取消 Pi 原生压缩，并始终接管手动、threshold 和 overflow 压缩；即使插件没有产出可提交状态（例如收益不足、摘要失败或请求预算不足）也取消原生行为，不回退到原生 compact。插件等待摘要期间会阻止另一轮插件压缩并发启动，避免 session leaf 改变后丢弃结果。压缩进行中，`tree`/`fork`/`clone`/`new`/`resume` 会被取消，`/reload` 会在输入层被拦截；按下 Esc（包括空闲时发起的 `/auto-compact`）或退出（session_shutdown）会中断摘要请求及重试等待，并丢弃未提交的部分结果。若配置让受保护尾部本身接近或超过模型窗口，自动压缩将找不到可处理区间；此时应降低 `keepRecent` 或 `trigger`，再执行 `/auto-compact-config`。
+每次有效状态变化还会在会话末尾追加一条 `custom` 展示快照（`auto-compact-snapshot`）。它是派生展示记录，不是有效状态的一部分：丢失、写入失败或不存在都不影响投影和下一次压缩，插件也不会用它恢复块树。展示快照因而不参与模型上下文、摘要目标、参考材料和 token 记账。
+
+插件取消 Pi 原生压缩，并始终接管手动、threshold 和 overflow 压缩；即使插件没有产出可提交状态（例如收益不足、摘要失败或请求预算不足）也取消原生行为，不回退到原生 compact。关闭自动压缩只停止插件的阈值扫描，不会因此放行原生压缩。插件等待摘要期间会阻止另一轮插件压缩并发启动，避免 session leaf 改变后丢弃结果。压缩进行中，`tree`/`fork`/`clone`/`new`/`resume` 会被取消，`/reload` 会在输入层被拦截；按下 Esc（包括空闲时发起的 `/auto-compact`）或退出（session_shutdown）会中断摘要请求及重试等待，并丢弃未提交的部分结果。若配置让受保护尾部本身接近或超过模型窗口，自动压缩将找不到可处理区间；此时应降低 `keepRecent` 或 `trigger`，再执行 `/auto-compact-config`。
 
 ## 摘要请求排查
 

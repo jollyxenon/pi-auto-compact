@@ -90,6 +90,32 @@ export function entryToPromptParts(entry: SessionEntry, includeThinking = true, 
 	return withHeader(`[${entry.id} ${entry.type}]`, [{ type: "text", text: JSON.stringify(entry) }]);
 }
 
+/** CJK code points that the chars/4 heuristic underestimates at roughly one token each. */
+const CJK_CHARACTERS = /[\u1100-\u11ff\u2e80-\u303f\u3040-\u30ff\u3130-\u318f\u3400-\u4dbf\u4e00-\u9fff\ua960-\ua97f\uac00-\ud7af\uf900-\ufaff\ufe30-\ufe4f\uff00-\uff60]/g;
+
+/** Fixed per-image prompt cost, mirroring Pi's 4800-character image estimate. */
+const IMAGE_PROMPT_TOKENS = 1200;
+
+/**
+ * Prompt-side token estimate, deliberately conservative: one token per CJK character and one token
+ * per three remaining characters. Pi's chars/4 rate is calibrated for Latin prose; code, JSON,
+ * punctuation-heavy tool output and CJK scripts all tokenize denser, so a window check built on
+ * that rate can pass while the real request is far larger. This is still a heuristic — the
+ * provider's own tokenizer decides — so it errs upward instead of promising an exact count.
+ */
+export function estimatePromptTokens(text: string): number {
+	const wide = text.match(CJK_CHARACTERS)?.length ?? 0;
+	return Math.ceil((text.length - wide) / 3) + wide;
+}
+
+/** Request-side estimate of the parts a provider receives, images included. */
+export function estimatePromptPartTokens(parts: PromptPart[]): number {
+	return parts.reduce(
+		(total, part) => total + (part.type === "image" ? IMAGE_PROMPT_TOKENS : estimatePromptTokens(part.text)),
+		0,
+	);
+}
+
 /** Flatten prompt parts to text; image payloads never appear. */
 export function renderPromptParts(parts: PromptPart[]): string {
 	return parts.map((part) => (part.type === "text" ? part.text : imageToText(part))).join("");

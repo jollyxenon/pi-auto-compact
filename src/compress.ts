@@ -1,8 +1,8 @@
 /** Atomic hierarchical compaction operations. No function mutates its input state. */
 
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
-import { sessionEntryToContextMessages, type SessionEntry } from "@earendil-works/pi-coding-agent";
-import { resolveTokenLimit, type AutoCompactConfig } from "./config.ts";
+import { findCutPoint, sessionEntryToContextMessages, type SessionEntry } from "@earendil-works/pi-coding-agent";
+import type { AutoCompactConfig } from "./config.ts";
 import { activeChildFrontier, activeTopBlocks } from "./mapping.ts";
 import {
 	SUMMARIZER_SYSTEM_PROMPT,
@@ -14,7 +14,16 @@ import {
 	validateSummary,
 } from "./summarizer.ts";
 import type { CompactBlock, PluginState, PromptPart, SummarizeInput } from "./types.ts";
-import { entryToPromptParts, nextBlockId, renderBlockCard, renderPromptParts, type TokenEstimator } from "./util.ts";
+import { SNAPSHOT_CUSTOM_TYPE } from "./types.ts";
+import {
+	entryToPromptParts,
+	estimatePromptPartTokens,
+	estimatePromptTokens,
+	nextBlockId,
+	renderBlockCard,
+	renderPromptParts,
+	type TokenEstimator,
+} from "./util.ts";
 
 export interface CompressProgress {
 	phase: "starting" | "compressing" | "completed" | "skipped" | "error";
@@ -66,12 +75,16 @@ function cachedEntry(deps: CompressDeps, entry: SessionEntry): { parts: PromptPa
 	const cache = deps.entryCache;
 	const existing = cache.get(entry.id);
 	if (existing) return existing;
-	const parts = entryToPromptParts(entry, true, deps.supportsImages);
-	// Token accounting follows the message projection the model actually receives —
-	// images cost Pi's fixed per-image estimate, not the size of their base64 — while
-	// the parts stay the prompt payload. Entries that project no message cost nothing.
-	const tokens = sessionEntryToContextMessages(entry)
-		.reduce((sum, message) => sum + deps.estimate(message), 0);
+	const messages = sessionEntryToContextMessages(entry);
+	// System messages are prompt state: Pi replays the live prompt separately and a block only
+	// replaces conversation with a card, so prompt state is never summary material or source
+	// weight. Transcript-only records (extension state, model switches) stay inside block ranges
+	// for context_get, but project no model message and contribute no tokens either.
+	const conversation = messages.filter((message: AgentMessage) => message.role !== "system");
+	const parts = conversation.length === 0 ? [] : entryToPromptParts(entry, true, deps.supportsImages);
+	// Token accounting follows the conversation the block replaces — images cost Pi's fixed
+	// per-image estimate, not the size of their base64.
+	const tokens = conversation.reduce((sum, message) => sum + deps.estimate(message), 0);
 	const value = { parts, tokens };
 	cache.set(entry.id, value);
 	return value;
@@ -145,31 +158,80 @@ function currentContextEntries(deps: CompressDeps): SessionEntry[] {
 	];
 }
 
+/** Plugin display snapshots are transcript records: never summary targets, references, or context. */
+export function isSnapshotEntry(entry: SessionEntry): boolean {
+	return entry.type === "custom" && entry.customType === SNAPSHOT_CUSTOM_TYPE;
+}
+
+/** Context-visible entries eligible as plugin compression sources; display and native records excluded. */
+export function sourceEntriesFor(entries: SessionEntry[]): SessionEntry[] {
+	return entries.filter((entry) => entry.type !== "compaction" && !isSnapshotEntry(entry));
+}
+
 /** Select source entries that are currently visible and eligible for plugin compression. */
 function sourceEntries(deps: CompressDeps): SessionEntry[] {
-	return currentContextEntries(deps).filter((entry) => entry.type !== "compaction");
+	return sourceEntriesFor(currentContextEntries(deps));
 }
 
-/** Return the first session entry that contributes a message to the LLM context. */
-function firstCompressibleIndex(entries: SessionEntry[]): number {
-	const index = entries.findIndex((entry) => sessionEntryToContextMessages(entry).length > 0);
-	return index < 0 ? entries.length : index;
+/** An entry contributes compressible content only through its non-system messages. */
+function isCompressibleEntry(entry: SessionEntry): boolean {
+	return sessionEntryToContextMessages(entry).some((message: AgentMessage) => message.role !== "system");
 }
 
-/** Estimate a plain text fragment with the same estimator used for messages. */
-function estimateTextTokens(deps: CompressDeps, text: string): number {
-	return deps.estimate({ role: "user", content: text, timestamp: 0 } as AgentMessage);
+/** Return the first compressible entry at or after `from`, or entries.length when none exists. */
+function firstCompressibleIndex(entries: SessionEntry[], from = 0): number {
+	for (let index = Math.max(0, from); index < entries.length; index++) {
+		if (isCompressibleEntry(entries[index])) return index;
+	}
+	return entries.length;
 }
 
-/** Estimate prompt parts exactly as the provider will receive them, images included. */
-function estimatePartTokens(deps: CompressDeps, parts: PromptPart[]): number {
-	return deps.estimate({ role: "user", content: parts, timestamp: 0 } as AgentMessage);
+export interface CompactedPrefix {
+	/** Index of the first retained entry; entries.length means the whole visible history is covered. */
+	retainedFrom: number;
+	/** First retained entry ID, or undefined when nothing is retained. */
+	firstKeptEntryId?: string;
+	/** Set when the active blocks cannot describe a complete prefix of the visible history. */
+	reason?: string;
+}
+
+/**
+ * Resolve where the compacted prefix ends. Active blocks cover one contiguous envelope, so the
+ * retained pointer is the first entry after the last active block. The prefix must begin at the
+ * earliest context-visible entry: raw history before the oldest block is a gap that has to be
+ * compressed first, and the pointer must never advance over it.
+ */
+export function resolveCompactedPrefix(entries: SessionEntry[], state: PluginState): CompactedPrefix {
+	const firstCompressible = firstCompressibleIndex(entries);
+	const blocks = activeTopBlocks(entries, state);
+	if (blocks.length === 0) {
+		return { retainedFrom: firstCompressible, firstKeptEntryId: entries[firstCompressible]?.id };
+	}
+	const positions = new Map(entries.map((entry, index) => [entry.id, index] as const));
+	const start = positions.get(blocks[0].startEntryId);
+	const end = positions.get(blocks.at(-1)?.endEntryId ?? "");
+	if (start === undefined || end === undefined || end < start) {
+		return {
+			retainedFrom: firstCompressible,
+			firstKeptEntryId: entries[firstCompressible]?.id,
+			reason: `active blocks ${blocks[0].blockId}..${blocks.at(-1)?.blockId} are not on the current path`,
+		};
+	}
+	if (start > firstCompressible) {
+		return {
+			retainedFrom: firstCompressible,
+			firstKeptEntryId: entries[firstCompressible]?.id,
+			reason: `uncompressed history starts at ${entries[firstCompressible]?.id} but the oldest active block starts at ${blocks[0].startEntryId}; compress the leading range first`,
+		};
+	}
+	const retainedFrom = end + 1;
+	return { retainedFrom, firstKeptEntryId: entries[retainedFrom]?.id };
 }
 
 /** Reserve enough room for the generated card and one structural rewrite. */
 function summaryRequestTokensForParts(deps: CompressDeps, parts: PromptPart[]): number {
-	return estimateTextTokens(deps, SUMMARIZER_SYSTEM_PROMPT)
-		+ estimatePartTokens(deps, parts)
+	return estimatePromptTokens(SUMMARIZER_SYSTEM_PROMPT)
+		+ estimatePromptPartTokens(parts)
 		+ summaryOutputTokenLimit(deps.cfg.blockTokenCeiling)
 		+ SUMMARY_REWRITE_RESERVE;
 }
@@ -179,12 +241,21 @@ function summaryRequestTokens(deps: CompressDeps, input: SummarizeInput): number
 	return summaryRequestTokensForParts(deps, buildSummarizeParts(input));
 }
 
-/** A cut point is immediately before the next user or assistant message. */
+/** Message roles Pi may begin the retained tail with; tool results must stay with their tool call. */
+const CUT_POINT_ROLES = new Set(["user", "assistant", "bashExecution", "custom", "branchSummary", "compactionSummary"]);
+
+/** Whether Pi's cut-point policy accepts this entry as the start of the retained tail. */
+function isCutPointEntry(entry: SessionEntry): boolean {
+	return sessionEntryToContextMessages(entry).some((message: AgentMessage) => CUT_POINT_ROLES.has(message.role));
+}
+
+/** A cut point is the next entry Pi is allowed to keep verbatim, skipping metadata-only entries. */
 export function isTurnBoundary(entries: SessionEntry[], index: number): boolean {
-	if (index < 0 || index >= entries.length - 1) return false;
-	const next = entries[index + 1];
-	return next.type === "message"
-		&& (next.message.role === "user" || next.message.role === "assistant");
+	for (let next = index + 1; next < entries.length; next++) {
+		if (sessionEntryToContextMessages(entries[next]).length === 0) continue;
+		return isCutPointEntry(entries[next]);
+	}
+	return false;
 }
 
 /** Collect complete reference entries and block cards without including the target.
@@ -210,7 +281,7 @@ function collectReferenceParts(
 	};
 
 	for (const entry of visibleEntries) {
-		if (entry.type === "compaction") continue;
+		if (entry.type === "compaction" || isSnapshotEntry(entry)) continue;
 		const order = positions.get(entry.id) ?? visiblePositions.get(entry.id) ?? 0;
 		if (excludedSourceIds.has(entry.id)) continue;
 		const block = byFirstSource.get(entry.id);
@@ -279,7 +350,7 @@ function fitReferenceContext(
 	const selected: ReferencePart[] = [];
 	let selectedTokens = 0;
 	for (const part of ranked) {
-		const partTokens = estimatePartTokens(deps, part.parts) + 1;
+		const partTokens = estimatePromptPartTokens(part.parts) + 1;
 		if (selectedTokens + partTokens > available) continue;
 		selected.push(part);
 		selectedTokens += partTokens;
@@ -554,6 +625,7 @@ interface ScopedState {
 	state: PluginState;
 	branchFrontiers: Record<string, string[]>;
 	branchChildFrontiers: Record<string, Record<string, string[]>>;
+	branchPointers: Record<string, string>;
 }
 
 /** Select the current branch frontier, then isolate the temporary operation state. */
@@ -571,18 +643,20 @@ function scopeToActiveBranch(
 			childBlockIdsByParent: activeChildren,
 			topLevelBlockIdsByBranch: undefined,
 			childBlockIdsByParentByBranch: undefined,
+			firstKeptEntryIdByBranch: undefined,
 		},
 		branchFrontiers: { ...(state.topLevelBlockIdsByBranch ?? {}) },
 		branchChildFrontiers: { ...(state.childBlockIdsByParentByBranch ?? {}) },
+		branchPointers: { ...(state.firstKeptEntryIdByBranch ?? {}) },
 	};
 }
 
-function rememberBranchFrontier(
-	deps: CompressDeps,
-	state: PluginState,
-	branchFrontiers: Record<string, string[]>,
-	branchChildFrontiers: Record<string, Record<string, string[]>>,
-): PluginState {
+/**
+ * Record the committed frontier, internal edges, and retained pointer under every active-path
+ * anchor. The pointer is derived from the committed envelope, so it always equals the first
+ * entry the model still receives as raw history.
+ */
+function rememberBranchFrontier(deps: CompressDeps, state: PluginState, scoped: ScopedState): PluginState {
 	const keys = new Set<string>();
 	const addKey = (entry: SessionEntry | undefined): void => {
 		keys.add(entry?.id ?? "__root__");
@@ -590,15 +664,19 @@ function rememberBranchFrontier(
 	addKey(deps.branchEntries.at(-1));
 	addKey(currentContextEntries(deps).at(-1));
 	addKey(sourceEntries(deps).at(-1));
-	const topLevelBlockIdsByBranch = { ...branchFrontiers };
-	const childBlockIdsByParentByBranch = { ...branchChildFrontiers };
+	const firstKeptEntryId = resolveCompactedPrefix(sourceEntries(deps), state).firstKeptEntryId;
+	const topLevelBlockIdsByBranch = { ...scoped.branchFrontiers };
+	const childBlockIdsByParentByBranch = { ...scoped.branchChildFrontiers };
+	const firstKeptEntryIdByBranch = { ...scoped.branchPointers };
 	for (const key of keys) {
 		topLevelBlockIdsByBranch[key] = [...state.topLevelBlockIds];
 		childBlockIdsByParentByBranch[key] = Object.fromEntries(
 			Object.entries(state.childBlockIdsByParent).map(([parentId, childIds]) => [parentId, [...childIds]]),
 		);
+		if (firstKeptEntryId === undefined) delete firstKeptEntryIdByBranch[key];
+		else firstKeptEntryIdByBranch[key] = firstKeptEntryId;
 	}
-	return { ...state, topLevelBlockIdsByBranch, childBlockIdsByParentByBranch };
+	return { ...state, topLevelBlockIdsByBranch, childBlockIdsByParentByBranch, firstKeptEntryIdByBranch };
 }
 
 interface AutoCandidate {
@@ -614,18 +692,11 @@ interface AutoCandidateSearch {
 	minimumRequestTokens?: number;
 }
 
-/** Compute the first entry in the protected suffix and keep complete turns intact. */
-function protectedStart(index: EntryIndex, entries: SessionEntry[], keepTokens: number): number {
+/** Start of the retained tail, at Pi's own cut point. The plugin summarizes the same prefix Pi
+ * would, so a split turn's prefix is folded into the leading block instead of a separate checkpoint. */
+function protectedStart(entries: SessionEntry[], keepTokens: number): number {
 	if (entries.length === 0) return 0;
-	let start = entries.length - 1;
-	let accumulated = 0;
-	for (let i = entries.length - 1; i >= 0; i--) {
-		accumulated += index.tokens[i];
-		start = i;
-		if (accumulated >= keepTokens) break;
-	}
-	while (start > 0 && !isTurnBoundary(entries, start - 1)) start--;
-	return start;
+	return findCutPoint(entries, 0, entries.length, keepTokens).firstKeptEntryIndex;
 }
 
 /** Tool results are only valid when their matching tool call is in the same range.
@@ -664,7 +735,8 @@ function nextUncompressedRun(
 	return undefined;
 }
 
-/** Return true when any uncompressed source remains outside the protected suffix. */
+/** Return true when any compressible conversation remains outside the protected suffix.
+ * Prompt state and metadata never need coverage, so they do not count as residue. */
 function hasUncompressedSource(
 	entries: SessionEntry[],
 	state: PluginState,
@@ -673,27 +745,8 @@ function hasUncompressedSource(
 ): boolean {
 	const occupied = occupiedSourceIds(entries, state);
 	for (let i = Math.max(0, startIndex); i < protectedFrom; i++) {
+		if (!isCompressibleEntry(entries[i])) continue;
 		if (!occupied.has(entries[i].id)) return true;
-	}
-	return false;
-}
-
-/** Return true when a protected tool result can pull its still-raw call into the candidate range. */
-function canExtendThroughProtectedToolResult(
-	entries: SessionEntry[],
-	protectedFrom: number,
-	occupied: Set<string>,
-): boolean {
-	const entry = entries[protectedFrom];
-	if (entry?.type !== "message") return false;
-	if (entry.message.role !== "toolResult") return false;
-	const toolCallId = entry.message.toolCallId;
-	for (let index = protectedFrom - 1; index >= 0; index--) {
-		const candidate = entries[index];
-		if (candidate.type !== "message" || candidate.message.role !== "assistant") continue;
-		if (candidate.message.content.some((part) => part.type === "toolCall" && part.id === toolCallId)) {
-			return !occupied.has(candidate.id);
-		}
 	}
 	return false;
 }
@@ -701,10 +754,12 @@ function canExtendThroughProtectedToolResult(
 /** Serialize the target range through the per-operation entry cache. */
 function serializeRangeCached(deps: CompressDeps, entries: SessionEntry[]): PromptPart[] {
 	const parts: PromptPart[] = [];
-	entries.forEach((entry, index) => {
-		if (index > 0) parts.push({ type: "text", text: "\n\n" });
-		parts.push(...cachedEntry(deps, entry).parts);
-	});
+	for (const entry of entries) {
+		const entryParts = cachedEntry(deps, entry).parts;
+		if (entryParts.length === 0) continue;
+		if (parts.length > 0) parts.push({ type: "text", text: "\n\n" });
+		parts.push(...entryParts);
+	}
 	return parts;
 }
 
@@ -841,22 +896,22 @@ export async function runAutoCompression(deps: CompressDeps, inputState: PluginS
 
 	const entries = source;
 	const index = entryIndex(deps, entries);
-	const keep = resolveTokenLimit(deps.cfg.keepRecent, deps.contextWindow);
-	const protectedFrom = protectedStart(index, entries, keep);
-	const protectedEntry = entries[protectedFrom];
-	const protectedMessage = protectedEntry?.type === "message" ? protectedEntry.message : undefined;
+	const protectedFrom = protectedStart(entries, deps.cfg.keepRecentTokens);
 	const compressionStart = firstCompressibleIndex(entries);
 	let working = scoped.state;
+	// The prefix must already cover every compressible entry before the retained pointer. Raw
+	// conversation at the head cannot be skipped, because advancing past it would drop content;
+	// prompt state and metadata may precede the prefix because they are never block targets.
+	const prefix = resolveCompactedPrefix(entries, working);
+	if (prefix.reason) return { status: "error", reason: prefix.reason, createdBlocks: [] };
+	const prefixStart = prefix.retainedFrom;
 	const initiallyOccupied = occupiedSourceIds(entries, working);
 	let protectedIncompleteTail = false;
-	const adjustedProtectedFrom = protectedMessage?.role === "toolResult"
-		&& canExtendThroughProtectedToolResult(entries, protectedFrom, initiallyOccupied)
-		? protectedFrom + 1
-		: protectedFrom;
 	const createdBlocks: CompactBlock[] = [];
 	let totalTokens = 0;
 	let compressedTokens = 0;
-	for (let position = compressionStart; position < adjustedProtectedFrom; position++) {
+	for (let position = compressionStart; position < protectedFrom; position++) {
+		if (!isCompressibleEntry(entries[position])) continue;
 		const tokens = index.tokens[position] ?? 0;
 		totalTokens += tokens;
 		if (initiallyOccupied.has(entries[position].id)) compressedTokens += tokens;
@@ -872,12 +927,12 @@ export async function runAutoCompression(deps: CompressDeps, inputState: PluginS
 
 	for (;;) {
 		throwIfAborted(deps);
-		const run = nextUncompressedRun(entries, working, compressionStart, adjustedProtectedFrom);
+		const run = nextUncompressedRun(entries, working, prefixStart, protectedFrom);
 		if (!run) break;
 		const search = findAutoCandidate(deps, working, entries, index, run);
 		if (!search.candidate) {
 			if (search.boundaries === 0
-				&& (run.to === entries.length - 1 || run.to + 1 === adjustedProtectedFrom)) {
+				&& (run.to === entries.length - 1 || run.to + 1 === protectedFrom)) {
 				protectedIncompleteTail = true;
 				break;
 			}
@@ -915,19 +970,19 @@ export async function runAutoCompression(deps: CompressDeps, inputState: PluginS
 		if (stable.blocks.length > 0) reportProgress(deps, compressedTokens, totalTokens, stable.blocks);
 	}
 
-	if (hasUncompressedSource(entries, working, compressionStart, adjustedProtectedFrom) && !protectedIncompleteTail) {
+	if (hasUncompressedSource(entries, working, prefixStart, protectedFrom) && !protectedIncompleteTail) {
 		return { status: "error", reason: "uncompressed content remains before the protected suffix", createdBlocks };
 	}
 	if (createdBlocks.length === 0) {
 		const normalized = inputState.topLevelBlockIds.length !== working.topLevelBlockIds.length
 			|| inputState.topLevelBlockIds.some((id, index) => id !== working.topLevelBlockIds[index]);
 		return normalized
-			? { status: "skipped", state: rememberBranchFrontier(deps, working, scoped.branchFrontiers, scoped.branchChildFrontiers), reason: "no compressible entries" }
+			? { status: "skipped", state: rememberBranchFrontier(deps, working, scoped), reason: "no compressible entries" }
 			: { status: "skipped", reason: "no compressible entries" };
 	}
 	return {
 		status: "created",
-		state: rememberBranchFrontier(deps, working, scoped.branchFrontiers, scoped.branchChildFrontiers),
+		state: rememberBranchFrontier(deps, working, scoped),
 		createdBlocks,
 	};
 }
@@ -947,6 +1002,21 @@ export async function runManualCompression(
 	const start = positions.get(startId);
 	let end = positions.get(endId);
 	if (start === undefined || end === undefined || end < start) return { status: "error", reason: "invalid source range" };
+	// Only the leading uncompressed range may be compacted, so the compacted history always
+	// stays one contiguous prefix and the retained tail is never reordered around a gap.
+	const prefix = resolveCompactedPrefix(source, state);
+	if (prefix.reason) return { status: "error", reason: prefix.reason };
+	// Leading prompt state and metadata may be named explicitly, but no uncompressed conversation
+	// may be skipped. A start inside an existing block is still reported by the overlap check below.
+	const expectedStart = firstCompressibleIndex(source, prefix.retainedFrom);
+	if (start > expectedStart) {
+		return {
+			status: "error",
+			reason: expectedStart >= source.length
+				? "the whole visible history is already compacted; nothing remains to compress"
+				: `startId would skip uncompressed history; start at ${source[expectedStart]?.id}`,
+		};
+	}
 	while (end < source.length - 1 && !isTurnBoundary(source, end)) end++;
 	const requestedEnd = end;
 	if (end >= source.length - 1) return { status: "error", reason: "the current incomplete tail cannot be compressed" };
@@ -974,7 +1044,7 @@ export async function runManualCompression(
 	if (stable.blocks.length > 0) reportProgress(deps, sourceTokens, sourceTokens, stable.blocks);
 	return {
 		status: "created",
-		state: rememberBranchFrontier(deps, stable.state, scoped.branchFrontiers, scoped.branchChildFrontiers),
+		state: rememberBranchFrontier(deps, stable.state, scoped),
 		createdBlocks: [created.block, ...stable.blocks],
 	};
 }
@@ -999,7 +1069,7 @@ export async function runManualAdjustment(
 	if (stable.blocks.length > 0) reportProgress(deps, totalTokens, totalTokens, stable.blocks);
 	return {
 		status: "adjusted",
-		state: rememberBranchFrontier(deps, stable.state, scoped.branchFrontiers, scoped.branchChildFrontiers),
+		state: rememberBranchFrontier(deps, stable.state, scoped),
 		createdBlocks: [...(promoted.created ? [promoted.block] : []), ...stable.blocks],
 	};
 }
@@ -1091,7 +1161,7 @@ export async function runTreeMerge(
 	if (stable.blocks.length > 0) reportProgress(deps, totalTokens, totalTokens, stable.blocks);
 	return {
 		status: "adjusted",
-		state: rememberBranchFrontier(deps, stable.state, scoped.branchFrontiers, scoped.branchChildFrontiers),
+		state: rememberBranchFrontier(deps, stable.state, scoped),
 		createdBlocks: [...(promoted.created ? [merged] : []), ...stable.blocks],
 	};
 }
@@ -1116,7 +1186,7 @@ export async function runTreeSplit(
 		state.blocks.find((candidate) => candidate.blockId === id)).filter((candidate): candidate is CompactBlock => candidate !== undefined));
 	return {
 		status: "adjusted",
-		state: rememberBranchFrontier(deps, replaced, scoped.branchFrontiers, scoped.branchChildFrontiers),
+		state: rememberBranchFrontier(deps, replaced, scoped),
 		createdBlocks: [],
 	};
 }

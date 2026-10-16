@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import type { SessionEntry } from "@earendil-works/pi-coding-agent";
+import { sessionEntryToContextMessages } from "@earendil-works/pi-coding-agent";
 import { buildMapping, projectMessages } from "../src/mapping.ts";
 import type { CompactBlock } from "../src/types.ts";
 
@@ -66,4 +67,22 @@ test("mapping discards an injected message inside a compacted source span", () =
 	const projected = projectMessages([original, injected, secondMessage], mapping, [covering]);
 	assert.equal(projected.length, 1);
 	assert.match((projected[0] as { content: string }).content, /ac_000001/);
+});
+
+test("mapping keeps prompt state inside a compacted source span", () => {
+	const promptEntry = {
+		type: "message",
+		id: "sys",
+		parentId: null,
+		timestamp: "2026-01-01T00:00:00.000Z",
+		message: { role: "system", content: "", sections: { rules: "PROMPT-STATE" }, timestamp: 0 },
+	} as unknown as SessionEntry;
+	const promptMessage = sessionEntryToContextMessages(promptEntry)[0];
+	const messages = [promptMessage, original];
+	const mapping = buildMapping([promptEntry, entry], messages);
+	const covering = { ...block, startEntryId: "sys", endEntryId: "e1" };
+	const projected = projectMessages(messages, mapping, [covering]);
+	assert.equal(projected.length, 2);
+	assert.match((projected[0] as { content: string }).content, /ac_000001/);
+	assert.equal(projected[1], promptMessage);
 });

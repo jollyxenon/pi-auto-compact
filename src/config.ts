@@ -2,19 +2,15 @@
 
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { CONFIG_DIR_NAME, getAgentDir } from "@earendil-works/pi-coding-agent";
-
-export type TokenLimit =
-	| { mode: "tokens"; value: number }
-	| { mode: "percent"; value: number };
+import { CONFIG_DIR_NAME, DEFAULT_COMPACTION_SETTINGS, getAgentDir } from "@earendil-works/pi-coding-agent";
 
 export interface AutoCompactConfig {
 	/** Whether threshold and overflow requests should run automatic compaction. */
 	enabled: boolean;
-	/** Starts automatic compaction when projected context reaches this limit. */
-	trigger: TokenLimit;
-	/** Recent source entries protected from automatic compaction. */
-	keepRecent: TokenLimit;
+	/** Start automatic compaction once estimated context tokens exceed (window - reserveTokens). */
+	reserveTokens: number;
+	/** Recent conversation tokens kept verbatim; measured with Pi's estimateTokens. */
+	keepRecentTokens: number;
 	/** Maximum tokens in the complete card sent to the main model. */
 	blockTokenCeiling: number;
 	/** k: after the (k + 1)th same-level block appears, merge the oldest k. */
@@ -30,8 +26,9 @@ export interface AutoCompactConfig {
 
 export const DEFAULT_CONFIG: AutoCompactConfig = {
 	enabled: true,
-	trigger: { mode: "percent", value: 0.85 },
-	keepRecent: { mode: "percent", value: 0.25 },
+	// Compaction trigger and retained window follow Pi's own compaction settings.
+	reserveTokens: DEFAULT_COMPACTION_SETTINGS.reserveTokens,
+	keepRecentTokens: DEFAULT_COMPACTION_SETTINGS.keepRecentTokens,
 	blockTokenCeiling: 2000,
 	blockMergeThreshold: 3,
 	maxBlocks: { enabled: true, value: 8 },
@@ -60,8 +57,6 @@ export function loadConfig(cwd: string, includeProject: boolean): AutoCompactCon
 			...config,
 			...override,
 			// Nested objects merge field-wise so a partial override never disables a flag silently.
-			trigger: override.trigger ?? config.trigger,
-			keepRecent: override.keepRecent ?? config.keepRecent,
 			maxBlocks: override.maxBlocks === undefined ? config.maxBlocks : { ...config.maxBlocks, ...override.maxBlocks },
 		};
 	}
@@ -82,9 +77,8 @@ export function saveConfig(cwd: string, includeProject: boolean, config: AutoCom
 /** Enforce the state-machine invariants once at load time. */
 export function validateConfig(config: AutoCompactConfig): void {
 	if (typeof config.enabled !== "boolean") throw new Error("enabled must be a boolean");
-	for (const [name, limit] of [["trigger", config.trigger], ["keepRecent", config.keepRecent]] as const) {
-		if (!Number.isFinite(limit.value) || limit.value <= 0) throw new Error(`${name}.value must be positive`);
-		if (limit.mode === "percent" && limit.value > 1) throw new Error(`${name}.value must be <= 1 in percent mode`);
+	for (const [name, value] of [["reserveTokens", config.reserveTokens], ["keepRecentTokens", config.keepRecentTokens]] as const) {
+		if (!Number.isInteger(value) || value <= 0) throw new Error(`${name} must be a positive integer`);
 	}
 	if (!Number.isInteger(config.blockMergeThreshold) || config.blockMergeThreshold < 2) {
 		throw new Error("blockMergeThreshold must be an integer >= 2");
@@ -96,19 +90,9 @@ export function validateConfig(config: AutoCompactConfig): void {
 		throw new Error("maxBlocks.value must be an integer >= 1");
 	}
 	if (typeof config.maxBlocks.enabled !== "boolean") throw new Error("maxBlocks.enabled must be a boolean");
-	// With the same unit the protected tail must stay smaller than the trigger, or automatic
-	// compaction can never find a compressible range.
-	if (config.trigger.mode === config.keepRecent.mode && config.keepRecent.value >= config.trigger.value) {
-		throw new Error("keepRecent.value must be smaller than trigger.value in the same mode");
-	}
 	if (!Number.isInteger(config.defaultPageSize) || !Number.isInteger(config.maxPageSize)
 		|| config.defaultPageSize < 256 || config.maxPageSize < config.defaultPageSize) {
 		throw new Error("page sizes must be integers with 256 <= defaultPageSize <= maxPageSize");
 	}
 	if (config.debug !== undefined && typeof config.debug !== "boolean") throw new Error("debug must be a boolean");
-}
-export function resolveTokenLimit(limit: TokenLimit, contextWindow: number): number {
-	return limit.mode === "tokens"
-		? Math.max(0, Math.floor(limit.value))
-		: Math.max(0, Math.floor(contextWindow * limit.value));
 }

@@ -53,6 +53,14 @@ function validState(parsed: unknown): parsed is PluginState {
 		&& (typeof state.childBlockIdsByParentByBranch !== "object"
 			|| state.childBlockIdsByParentByBranch === null
 			|| Array.isArray(state.childBlockIdsByParentByBranch))) return false;
+	// The retained pointer is validated against the active path when it is used; only its
+	// shape is enforced here so an old sidecar without the field still loads.
+	if (state.firstKeptEntryIdByBranch !== undefined
+		&& (typeof state.firstKeptEntryIdByBranch !== "object"
+			|| state.firstKeptEntryIdByBranch === null
+			|| Array.isArray(state.firstKeptEntryIdByBranch)
+			|| Object.values(state.firstKeptEntryIdByBranch as Record<string, unknown>)
+				.some((entryId) => typeof entryId !== "string" || entryId.length === 0))) return false;
 	const blocks = state.blocks as unknown[];
 	if (blocks.some((block) => !validBlock(block))) return false;
 	const blockIds = (state.blocks as PluginState["blocks"]).map((block) => block.blockId);

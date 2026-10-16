@@ -6,8 +6,10 @@ import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import { Key, matchesKey } from "@earendil-works/pi-tui";
 import {
 	buildSessionContext,
+	calculateContextTokens,
 	estimateTokens,
 	getAgentDir,
+	shouldCompact,
 	type ExtensionAPI,
 	type ExtensionContext,
 	type SessionEntry,
@@ -19,14 +21,18 @@ import {
 	runTreeMerge,
 	runTreeSplit,
 	isCompressionAborted,
+	isSnapshotEntry,
+	resolveCompactedPrefix,
+	sourceEntriesFor,
 	type CompressDeps,
 	type CompressOutcome,
 	type CompressProgress,
 } from "./compress.ts";
-import { defaultConfig, loadConfig, resolveTokenLimit, saveConfig, type AutoCompactConfig } from "./config.ts";
+import { defaultConfig, loadConfig, saveConfig, type AutoCompactConfig } from "./config.ts";
 import { makeContextGetTool } from "./contextGet.ts";
 import {
 	activeChildFrontier,
+	activeFirstKeptEntryId,
 	activeTopBlocks,
 	buildMapping,
 	projectMessages,
@@ -35,12 +41,13 @@ import {
 } from "./mapping.ts";
 import { loadState, saveState, statePathFor } from "./state.ts";
 import { createSummarizeFn } from "./summaryClient.ts";
-import { freshState, type PluginState } from "./types.ts";
+import { freshState, SNAPSHOT_CUSTOM_TYPE, type CompactSnapshotData, type EntryMessageMapping, type PluginState } from "./types.ts";
 import { messageToText, renderBlockCard } from "./util.ts";
 import {
 	blockTree,
 	choiceForm,
 	installAutoCompactFooter,
+	renderCompactSnapshotEntry,
 	showCompressionProgress,
 	type ChoiceItem,
 	type ProjectedContextUsage,
@@ -51,7 +58,6 @@ export default function autoCompactExtension(pi: ExtensionAPI) {
 	let sessionFile: string | null = null;
 	let sessionId: string | null = null;
 	let sessionLeafId: string | null = null;
-	let contextOverhead = 0;
 	let statePath: string | null = null;
 	let state = freshState();
 	let queue: Promise<void> = Promise.resolve();
@@ -59,6 +65,8 @@ export default function autoCompactExtension(pi: ExtensionAPI) {
 	let footer: { requestRender(): void; dispose(): void } | undefined;
 	let renderFooter = (): void => {};
 	let lastCompressionProgress: CompressProgress | undefined;
+	/** Projected context usage captured when the current operation started. */
+	let projectedBeforeOperation: number | undefined;
 	interface ActiveCompression {
 		controller: AbortController;
 		cleanup: () => void;
@@ -87,7 +95,6 @@ export default function autoCompactExtension(pi: ExtensionAPI) {
 			debugLog("session changed", { file, id, previousFile: sessionFile, previousId: sessionId });
 			sessionFile = file;
 			sessionId = id;
-			contextOverhead = 0;
 			projectedUsage = undefined;
 			statePath = file ? statePathFor(file) : null;
 			state = statePath ? loadState(statePath) : freshState();
@@ -185,6 +192,13 @@ export default function autoCompactExtension(pi: ExtensionAPI) {
 		}
 		const childBlockIdsByParent = filterChildren(activeChildFrontier(branchEntries, parent));
 		childBlockIdsByParentByBranch[leafId] = childBlockIdsByParent;
+		// Retain the pointer only for anchors that survive on the forked path.
+		const parentPointers = parent.firstKeptEntryIdByBranch ?? {};
+		const firstKeptEntryIdByBranch: Record<string, string> = {};
+		for (const key of Object.keys(topLevelBlockIdsByBranch)) {
+			const pointer = parentPointers[key];
+			if (pointer && branchIds.has(pointer)) firstKeptEntryIdByBranch[key] = pointer;
+		}
 		const inherited: PluginState = {
 			schemaVersion: 4,
 			blocks,
@@ -192,24 +206,52 @@ export default function autoCompactExtension(pi: ExtensionAPI) {
 			childBlockIdsByParent,
 			topLevelBlockIdsByBranch,
 			childBlockIdsByParentByBranch,
+			firstKeptEntryIdByBranch,
 			nextSeq: parent.nextSeq,
 		};
 		saveState(statePath, inherited);
 		state = inherited;
 	}
 
-	/** Estimate the total size of the block cards the projection inserts. */
-	function cardEstimate(blocks: ReturnType<typeof activeTopBlocks>): number {
-		return blocks.reduce(
-			(sum, block) => sum + estimateTokens({ role: "user", content: renderBlockCard(block), timestamp: 0 } as AgentMessage),
-			0,
-		);
+	/** Index of the newest entry that invalidates a usage anchor captured before it. Pi treats a
+	 * committed compaction as invalidating; the plugin's display snapshot plays the same role. */
+	function latestInvalidatingIndex(visible: SessionEntry[]): number {
+		for (let index = visible.length - 1; index >= 0; index--) {
+			const entry = visible[index];
+			if (entry.type === "context_edit" || isSnapshotEntry(entry)) return index;
+		}
+		return -1;
 	}
 
-	/** The native usage already contains block cards; keep them out of the overhead so the
-	 * footer does not count them once in the overhead and once in the projection. */
-	function updateOverhead(blocks: ReturnType<typeof activeTopBlocks>, nativeTokens: number, mappedRawEstimate: number): void {
-		contextOverhead = Math.max(contextOverhead, nativeTokens - mappedRawEstimate - cardEstimate(blocks));
+	/** Pi's context estimate: trust the last assistant usage and estimate only what follows it.
+	 * A context edit or a compression committed after that response invalidates the anchor, so the
+	 * whole projected request is estimated instead. */
+	function estimateProjectedTokens(
+		visible: SessionEntry[],
+		rawMessages: AgentMessage[],
+		mapping: EntryMessageMapping,
+		projected: AgentMessage[],
+		blocks: ReturnType<typeof activeTopBlocks>,
+	): number {
+		const invalidatedAfter = latestInvalidatingIndex(visible);
+		for (let index = rawMessages.length - 1; index >= 0; index--) {
+			const message = rawMessages[index];
+			if (message.role !== "assistant") continue;
+			if (message.stopReason === "aborted" || message.stopReason === "error") continue;
+			if (calculateContextTokens(message.usage) <= 0) continue;
+			const entryId = mapping.messageEntryIds[index];
+			const entryIndex = entryId ? mapping.entryPositions.get(entryId) ?? -1 : -1;
+			if (entryIndex <= invalidatedAfter) break;
+			// A block created after this response replaced part of the prompt it measured.
+			const anchorTimestamp = entryId ? visible[entryIndex]?.timestamp : undefined;
+			if (anchorTimestamp !== undefined && blocks.some((block) => block.createdAt > anchorTimestamp)) break;
+			const position = projected.indexOf(message);
+			if (position < 0) break;
+			let tokens = calculateContextTokens(message.usage);
+			for (let next = position + 1; next < projected.length; next++) tokens += estimateTokens(projected[next]);
+			return tokens;
+		}
+		return projected.reduce((sum, message) => sum + estimateTokens(message), 0);
 	}
 
 	/** Recalculate the footer's context usage from the messages actually projected to the model. */
@@ -224,21 +266,10 @@ export default function autoCompactExtension(pi: ExtensionAPI) {
 			return;
 		}
 		const blocks = activeTopBlocks(visible, state);
-		const rawEstimate = rawMessages.reduce((sum, message) => sum + estimateTokens(message), 0);
-		const projectedEstimate = messages && mapping
-			? projectMessages(rawMessages, mapping, blocks).reduce((sum, message) => sum + estimateTokens(message), 0)
-			: projectSessionEntries(visible, blocks).reduce((sum, message) => sum + estimateTokens(message), 0);
-		const nativeTokens = ctx.getContextUsage()?.tokens;
-		if (nativeTokens !== undefined && nativeTokens !== null) {
-			const mappedRawEstimate = messages && mapping
-				? rawMessages.reduce(
-					(sum, message, index) => sum + (mapping.messageEntryIds[index] === null ? 0 : estimateTokens(message)),
-					0,
-				)
-				: rawEstimate;
-			updateOverhead(blocks, nativeTokens, mappedRawEstimate);
-		}
-		projectedUsage = { tokens: contextOverhead + projectedEstimate };
+		const projected = messages
+			? projectMessages(rawMessages, mapping, blocks)
+			: projectSessionEntries(visible, blocks);
+		projectedUsage = { tokens: estimateProjectedTokens(visible, rawMessages, mapping, projected, blocks) };
 		renderFooter();
 	}
 
@@ -246,7 +277,18 @@ export default function autoCompactExtension(pi: ExtensionAPI) {
 	function beginCompression(ctx: ExtensionContext): void {
 		lastCompressionProgress = { phase: "starting", compressedTokens: 0, totalTokens: 0 };
 		refreshProjectedUsage(ctx);
-		debugLog("compression started", { session: sessionId });
+		projectedBeforeOperation = projectedUsage?.tokens;
+		const entries = sourceEntriesFor(ctx.sessionManager.buildContextEntries());
+		const prefix = resolveCompactedPrefix(entries, state);
+		// The stored record is reported for diagnosis; the committed block envelope stays authoritative.
+		debugLog("compression started", {
+			session: sessionId,
+			leaf: ctx.sessionManager.getLeafId(),
+			storedPointer: activeFirstKeptEntryId(entries, state) ?? null,
+			retainedFrom: prefix.firstKeptEntryId ?? null,
+			firstUncompressed: entries[prefix.retainedFrom]?.id ?? null,
+			topLevelBlocks: state.topLevelBlockIds.length,
+		});
 		showCompressionProgress(ctx, lastCompressionProgress);
 	}
 
@@ -269,6 +311,14 @@ export default function autoCompactExtension(pi: ExtensionAPI) {
 			reason: outcome.reason,
 			createdBlocks: outcome.createdBlocks?.map((block) => ({ blockId: block.blockId, level: block.level })),
 		});
+		if (outcome.state) {
+			const entries = sourceEntriesFor(ctx.sessionManager.buildContextEntries());
+			debugLog("compression committed", {
+				retainedFrom: resolveCompactedPrefix(entries, outcome.state).firstKeptEntryId ?? null,
+				topLevelBlockIds: outcome.state.topLevelBlockIds,
+				frontierOnly: (outcome.createdBlocks?.length ?? 0) === 0,
+			});
+		}
 		showCompressionProgress(ctx, {
 			phase: failed ? "error" : skipped ? "skipped" : "completed",
 			compressedTokens: failed || skipped ? previous?.compressedTokens ?? 0 : previous?.totalTokens ?? 0,
@@ -283,6 +333,60 @@ export default function autoCompactExtension(pi: ExtensionAPI) {
 			status: "error",
 			reason: error instanceof Error ? error.message : String(error),
 		});
+	}
+
+	/** Identity of the outgoing cards plus the retained pointer; equal state is not re-appended. */
+	function snapshotSignature(topLevelBlockIds: string[], firstKeptEntryId: string | undefined): string {
+		return JSON.stringify([topLevelBlockIds, firstKeptEntryId ?? null]);
+	}
+
+	/** Signature of the newest snapshot already recorded on the current branch. */
+	function currentSnapshotSignature(ctx: ExtensionContext): string | undefined {
+		const branch = ctx.sessionManager.getBranch();
+		for (let index = branch.length - 1; index >= 0; index--) {
+			const entry = branch[index];
+			if (entry.type !== "custom" || entry.customType !== SNAPSHOT_CUSTOM_TYPE) continue;
+			const data = entry.data as CompactSnapshotData | undefined;
+			if (data) return snapshotSignature(data.topLevelBlockIds, data.firstKeptEntryId);
+		}
+		return undefined;
+	}
+
+	/**
+	 * Append the display-only snapshot for a committed state. Pi stores it as a CustomEntry, so it
+	 * never becomes a model message and current cards still come from the sidecar. Appending advances
+	 * the session leaf, so callers run this only after the last real session-path check.
+	 */
+	function appendSnapshot(ctx: ExtensionContext, next: PluginState): void {
+		try {
+			const prefix = resolveCompactedPrefix(sourceEntriesFor(ctx.sessionManager.buildContextEntries()), next);
+			const signature = snapshotSignature(next.topLevelBlockIds, prefix.firstKeptEntryId);
+			if (signature === currentSnapshotSignature(ctx)) return;
+			const byId = new Map(next.blocks.map((block) => [block.blockId, block] as const));
+			const cardsText = next.topLevelBlockIds
+				.flatMap((blockId) => {
+					const block = byId.get(blockId);
+					return block ? [renderBlockCard(block)] : [];
+				})
+				.join("\n\n");
+			const data: CompactSnapshotData = {
+				topLevelBlockIds: [...next.topLevelBlockIds],
+				firstKeptEntryId: prefix.firstKeptEntryId,
+				cardsText,
+				tokensBefore: projectedBeforeOperation ?? 0,
+				tokensAfter: projectedUsage?.tokens ?? projectedBeforeOperation ?? 0,
+			};
+			pi.appendEntry<CompactSnapshotData>(SNAPSHOT_CUSTOM_TYPE, data);
+			sessionLeafId = ctx.sessionManager.getLeafId();
+			debugLog("snapshot appended", {
+				blocks: data.topLevelBlockIds.length,
+				firstKeptEntryId: data.firstKeptEntryId,
+				cardsChars: cardsText.length,
+			});
+		} catch (error) {
+			debugLog("snapshot append failed", { error: error instanceof Error ? error.message : String(error) });
+			if (ctx.hasUI) ctx.ui.notify(`auto-compact 展示快照写入失败: ${error instanceof Error ? error.message : String(error)}`, "warning");
+		}
 	}
 
 	/** Combine several abort sources so any one of them cancels the operation. */
@@ -401,16 +505,13 @@ export default function autoCompactExtension(pi: ExtensionAPI) {
 		if (ctx.hasUI) ctx.ui.notify(`${prefix}: ${error instanceof Error ? error.message : String(error)}`, "error");
 	}
 
-	function limitMode(limit: { mode: "tokens" | "percent" }): string {
-		return limit.mode === "percent" ? "百分比" : "绝对值";
-	}
-
 	pi.registerCommand("auto-compact", {
 		description: "Compress all currently uncompressed complete ranges before the protected recent tail",
 		handler: async (_args, ctx) => {
 			try {
 				const outcome = await executeAutoCompression(ctx);
 				if (outcome.state) {
+					appendSnapshot(ctx, outcome.state);
 					ctx.ui.notify(`已完成自动压缩，生成或提升 ${outcome.createdBlocks?.length ?? 0} 个块`, "info");
 				} else {
 					ctx.ui.notify(outcome.reason ?? "没有可压缩内容", "info");
@@ -453,6 +554,7 @@ export default function autoCompactExtension(pi: ExtensionAPI) {
 						const outcome = await runTreeMerge(deps, state, selected.parentId, selectedIds);
 						if (!outcome.state) throw new Error(outcome.reason);
 						commitState(outcome.state, ctx, deps.sessionKey);
+						appendSnapshot(ctx, outcome.state);
 						finishCompression(ctx, outcome);
 					} catch (error) {
 						if (isCompressionAborted(error, operationSignal)) {
@@ -474,6 +576,7 @@ export default function autoCompactExtension(pi: ExtensionAPI) {
 					const outcome = await runTreeSplit(deps, state, selected.parentId, block.blockId);
 					if (!outcome.state) throw new Error(outcome.reason);
 					commitState(outcome.state, ctx, deps.sessionKey);
+					appendSnapshot(ctx, outcome.state);
 					finishCompression(ctx, outcome);
 				} catch (error) {
 					if (isCompressionAborted(error, operationSignal)) {
@@ -497,10 +600,8 @@ export default function autoCompactExtension(pi: ExtensionAPI) {
 				reloadConfig(ctx);
 				const items: ChoiceItem[] = [
 					{ id: "enabled", label: "自动压缩", value: cfg.enabled ? "开启" : "关闭", values: ["开启", "关闭"] },
-					{ id: "triggerMode", label: "触发阈值单位", value: limitMode(cfg.trigger), values: ["百分比", "绝对值"], onChange: (item, all) => { const value = all.find((candidate) => candidate.id === "triggerValue"); if (value) { value.values = item.value === "百分比" ? ["60", "70", "80"] : ["100000", "150000", "200000"]; value.value = value.values[0] ?? value.value; } } },
-					{ id: "triggerValue", label: "触发阈值数值", value: cfg.trigger.mode === "percent" ? String(Math.round(cfg.trigger.value * 100)) : String(cfg.trigger.value), values: cfg.trigger.mode === "percent" ? ["60", "70", "80"] : ["100000", "150000", "200000"], editable: true },
-					{ id: "keepRecentMode", label: "保留最近内容单位", value: limitMode(cfg.keepRecent), values: ["百分比", "绝对值"], onChange: (item, all) => { const value = all.find((candidate) => candidate.id === "keepRecentValue"); if (value) { value.values = item.value === "百分比" ? ["5", "10", "15"] : ["5000", "10000", "15000"]; value.value = value.values[0] ?? value.value; } } },
-					{ id: "keepRecentValue", label: "保留最近内容数值", value: cfg.keepRecent.mode === "percent" ? String(Math.round(cfg.keepRecent.value * 100)) : String(cfg.keepRecent.value), values: cfg.keepRecent.mode === "percent" ? ["5", "10", "15"] : ["5000", "10000", "15000"], editable: true },
+					{ id: "reserveTokens", label: "触发前预留 token", value: String(cfg.reserveTokens), values: ["16384", "32768", "77400"], editable: true },
+					{ id: "keepRecentTokens", label: "保留最近 token", value: String(cfg.keepRecentTokens), values: ["10000", "20000", "40000"], editable: true },
 					{ id: "blockTokenCeiling", label: "压缩块上限", value: String(cfg.blockTokenCeiling), values: ["1000", "2000", "4000", "8000"], editable: true },
 					{ id: "blockMergeThreshold", label: "连续块合并数量", value: String(cfg.blockMergeThreshold), values: ["2", "3", "4", "5"], editable: true },
 					{ id: "maxBlocksEnabled", label: "顶层块数量限制", value: cfg.maxBlocks.enabled ? "开启" : "关闭", values: ["开启", "关闭"] },
@@ -510,12 +611,11 @@ export default function autoCompactExtension(pi: ExtensionAPI) {
 				const result = await choiceForm(ctx, "auto-compact 设置", items, (changed) => changed);
 				if (!result) return;
 				const get = (id: string) => result.find((item) => item.id === id)?.value ?? "";
-				const mode = (id: string): "percent" | "tokens" => get(id) === "百分比" ? "percent" : "tokens";
 				const next: AutoCompactConfig = {
 					...cfg,
 					enabled: get("enabled") === "开启",
-					trigger: { mode: mode("triggerMode"), value: Number(get("triggerValue")) / (mode("triggerMode") === "percent" ? 100 : 1) },
-					keepRecent: { mode: mode("keepRecentMode"), value: Number(get("keepRecentValue")) / (mode("keepRecentMode") === "percent" ? 100 : 1) },
+					reserveTokens: Number(get("reserveTokens")),
+					keepRecentTokens: Number(get("keepRecentTokens")),
 					blockTokenCeiling: Number(get("blockTokenCeiling")),
 					blockMergeThreshold: Number(get("blockMergeThreshold")),
 					maxBlocks: { enabled: get("maxBlocksEnabled") === "开启", value: Number(get("maxBlocksValue")) },
@@ -531,17 +631,20 @@ export default function autoCompactExtension(pi: ExtensionAPI) {
 	});
 
 	// Native /compact is deliberately disabled for manual requests. Automatic
-	// threshold and overflow requests run the same sliding plugin pass.
+	// threshold and overflow requests run the same sliding plugin pass. While the
+	// plugin is installed, native compaction never runs: disabling plugin automation
+	// only stops the plugin scan and does not turn the native path back on.
 	pi.on("session_before_compact", async (event, ctx) => {
-		if (!cfg.enabled && event.reason !== "manual") return;
 		if (event.reason === "manual") {
 			if (ctx.hasUI) ctx.ui.notify("Pi 原生 /compact 已禁用；请使用 /auto-compact 或 compact_context。", "warning");
 			return { cancel: true };
 		}
+		if (!cfg.enabled) return { cancel: true };
 		// 插件始终接管 threshold/overflow 压缩；即使失败也取消原生行为，不回退原生 compact。
 		try {
 			const operationKey = currentSessionKey(ctx);
 			const outcome = await executeAutoCompression(ctx, event.branchEntries, event.signal, [], ctx.sessionManager.buildContextEntries(), operationKey);
+			if (outcome.state) appendSnapshot(ctx, outcome.state);
 			if (outcome.status === "error" && ctx.hasUI) {
 				ctx.ui.notify(`auto-compact: ${outcome.reason ?? "压缩失败"}，旧上下文保持不变`, "error");
 			}
@@ -603,7 +706,6 @@ export default function autoCompactExtension(pi: ExtensionAPI) {
 	});
 
 	pi.on("model_select", (_event, ctx) => {
-		contextOverhead = 0;
 		projectedUsage = undefined;
 		refreshProjectedUsage(ctx);
 	});
@@ -655,30 +757,28 @@ export default function autoCompactExtension(pi: ExtensionAPI) {
 			});
 		}
 		const projected = projectMessages(event.messages, mapping, blocks);
-		if (!cfg.enabled) return { messages: projected };
-		const usage = ctx.getContextUsage();
-		const window = usage?.contextWindow ?? ctx.model?.contextWindow ?? 0;
+		const window = ctx.getContextUsage()?.contextWindow ?? ctx.model?.contextWindow ?? 0;
 		if (window <= 0) return { messages: projected };
-		const mappedRawEstimate = event.messages.reduce(
-			(sum, message, index) => sum + (mapping.messageEntryIds[index] === null ? 0 : estimateTokens(message)),
-			0,
-		);
-		const projectedEstimate = projected.reduce((sum, message) => sum + estimateTokens(message), 0);
-		const usageTokens = usage?.tokens;
-		if (usageTokens !== undefined && usageTokens !== null) {
-			updateOverhead(blocks, usageTokens, mappedRawEstimate);
-		}
-		projectedUsage = { tokens: contextOverhead + projectedEstimate };
+		projectedUsage = { tokens: estimateProjectedTokens(visible, event.messages, mapping, projected, blocks) };
 		renderFooter();
-		const projectedTokens = projectedUsage.tokens;
-		const trigger = resolveTokenLimit(cfg.trigger, window);
-		debugLog("context projected", { projectedTokens, trigger, window, messageCount: event.messages.length });
-		if (projectedTokens < trigger && projectedTokens < window) return { messages: projected };
+		const compactSource = sourceEntriesFor(visible);
+		debugLog("context projected", {
+			projectedTokens: projectedUsage.tokens,
+			window,
+			reserveTokens: cfg.reserveTokens,
+			keepRecentTokens: cfg.keepRecentTokens,
+			messageCount: event.messages.length,
+			cards: blocks.length,
+			retainedEntries: compactSource.length - resolveCompactedPrefix(compactSource, state).retainedFrom,
+			excludedSnapshots: visible.filter((entry) => isSnapshotEntry(entry)).length,
+		});
+		if (!shouldCompact(projectedUsage.tokens, window, cfg)) return { messages: projected };
 
 		const additionalMessages = outsideInjected;
 		const operationKey = currentSessionKey(ctx);
+		let outcome: CompressOutcome | undefined;
 		try {
-			const outcome = await executeAutoCompression(ctx, undefined, ctx.signal, additionalMessages, visible, operationKey);
+			outcome = await executeAutoCompression(ctx, undefined, ctx.signal, additionalMessages, visible, operationKey);
 			if (outcome.status === "error" && ctx.hasUI) {
 				ctx.ui.notify(`auto-compact: ${outcome.reason ?? "压缩失败"}，旧上下文保持不变`, "error");
 			}
@@ -698,9 +798,17 @@ export default function autoCompactExtension(pi: ExtensionAPI) {
 			const refreshedMapping = buildMapping(refreshedVisible, event.messages);
 			const refreshedProjected = projectMessages(event.messages, refreshedMapping, activeTopBlocks(refreshedVisible, state));
 			projectedUsage = {
-				tokens: contextOverhead + refreshedProjected.reduce((sum, message) => sum + estimateTokens(message), 0),
+				tokens: estimateProjectedTokens(
+					refreshedVisible,
+					event.messages,
+					refreshedMapping,
+					refreshedProjected,
+					activeTopBlocks(refreshedVisible, state),
+				),
 			};
 			renderFooter();
+			// The request messages already exist; only now may the display record move the leaf.
+			if (outcome?.state) appendSnapshot(ctx, state);
 			return { messages: refreshedProjected };
 		} catch (error) {
 			// 投影失败时退回压缩前已算好的投影，而不是静默把未压缩原文交给模型。
@@ -721,7 +829,9 @@ export default function autoCompactExtension(pi: ExtensionAPI) {
 		runExclusive,
 		finishCompression,
 		failCompression,
+		appendSnapshot: (next: PluginState, ctx: ExtensionContext) => appendSnapshot(ctx, next),
 	};
+	pi.registerEntryRenderer<CompactSnapshotData>(SNAPSHOT_CUSTOM_TYPE, renderCompactSnapshotEntry);
 	pi.registerTool(makeContextGetTool({ cfg, getState: shared.getState }));
 	pi.registerTool(makeCompactTool(shared));
 	pi.registerTool(makeAdjustTool({ cfg, ...shared }));

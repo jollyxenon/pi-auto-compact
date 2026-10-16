@@ -34,7 +34,28 @@ export interface PluginState {
 	topLevelBlockIdsByBranch?: Record<string, string[]>;
 	/** Stable internal edge selections keyed by active-path entry IDs. */
 	childBlockIdsByParentByBranch?: Record<string, Record<string, string[]>>;
+	/**
+	 * First entry after the compacted prefix, keyed by the same active-path anchors as
+	 * `topLevelBlockIdsByBranch`. The compacted prefix must start at the earliest
+	 * context-visible entry and cover every entry up to this pointer.
+	 */
+	firstKeptEntryIdByBranch?: Record<string, string>;
 	nextSeq: number;
+}
+
+/** Custom entry type used for the display-only summary appended after each change. */
+export const SNAPSHOT_CUSTOM_TYPE = "auto-compact-snapshot";
+
+/**
+ * Persistent transcript record for one committed state. Pi stores it as a CustomEntry,
+ * which never projects a model message; current cards always come from the sidecar state.
+ */
+export interface CompactSnapshotData {
+	topLevelBlockIds: string[];
+	firstKeptEntryId?: string;
+	cardsText: string;
+	tokensBefore: number;
+	tokensAfter: number;
 }
 
 export function freshState(): PluginState {

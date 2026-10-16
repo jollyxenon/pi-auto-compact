@@ -11,6 +11,8 @@ export interface AdjustToolDeps {
 	cfg: AutoCompactConfig;
 	getState: (ctx: ExtensionContext) => PluginState;
 	commitState: (state: PluginState, ctx: ExtensionContext, expectedSessionKey?: string) => void;
+	/** Append the display-only snapshot for a committed state. */
+	appendSnapshot: (state: PluginState, ctx: ExtensionContext) => void;
 	beginCompression: (ctx: ExtensionContext) => void;
 	buildCompressDeps: (
 		ctx: ExtensionContext,
@@ -56,6 +58,7 @@ export function makeAdjustTool(deps: AdjustToolDeps) {
 					const outcome = await runManualAdjustment(operation, deps.getState(ctx), params.blockIds, params.focus);
 					if (!outcome.state) throw new Error(outcome.reason ?? "Adjustment failed.");
 					deps.commitState(outcome.state, ctx, operation.sessionKey);
+					deps.appendSnapshot(outcome.state, ctx);
 					deps.finishCompression(ctx, outcome);
 					const blocks = outcome.createdBlocks ?? [];
 					return result(blocks.map((block) => `Created ${block.blockId} at level ${block.level}.`).join("\n"));

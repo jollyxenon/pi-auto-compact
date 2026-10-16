@@ -54,14 +54,17 @@ const VALID_SUMMARY = `<overview>
 function entries(turns = 5): SessionEntry[] {
 	const result: SessionEntry[] = [];
 	let parent: string | null = null;
+	// Assistant messages use Pi's real block-array shape so Pi's own estimateTokens sees them.
 	const add = (id: string, role: "user" | "assistant", content: string) => {
 		result.push({
 			type: "message",
 			id,
 			parentId: parent,
 			timestamp: "2026-01-01T00:00:00.000Z",
-			message: { role, content, timestamp: 0 },
-		} as SessionEntry);
+			message: role === "assistant"
+				? { role, content: [{ type: "text", text: content }], timestamp: 0 }
+				: { role, content, timestamp: 0 },
+		} as unknown as SessionEntry);
 		parent = id;
 	};
 	add("e0", "user", "The immutable session goal");
@@ -76,8 +79,8 @@ function entries(turns = 5): SessionEntry[] {
 function config(overrides: Partial<AutoCompactConfig> = {}): AutoCompactConfig {
 	return {
 		enabled: true,
-		trigger: { mode: "percent", value: 0.85 },
-		keepRecent: { mode: "tokens", value: 100 },
+		reserveTokens: 16384,
+		keepRecentTokens: 100,
 		blockTokenCeiling: 1000,
 		blockMergeThreshold: 3,
 		maxBlocks: { enabled: false, value: 8 },
@@ -108,7 +111,7 @@ function deps(
 async function compactTurns(count: number, cfg = config()): Promise<PluginState> {
 	let state = freshState();
 	for (let turn = 1; turn <= count; turn++) {
-		const startId = turn === 1 ? "e1" : `e${turn * 2 - 2}`;
+		const startId = turn === 1 ? "e0" : `e${turn * 2 - 2}`;
 		const endId = `e${turn * 2 - 1}`;
 		const outcome = await runManualCompression(deps(cfg), state, startId, endId);
 		assert.ok(outcome.state, outcome.reason);
@@ -165,12 +168,12 @@ test("automatic compaction starts at the first context-visible message after met
 	const branch: SessionEntry[] = [
 		{ type: "model_change", id: "meta", parentId: null, timestamp: "2026-01-01T00:00:00.000Z", provider: "x", modelId: "y" } as SessionEntry,
 		{ type: "message", id: "goal", parentId: "meta", timestamp: "2026-01-01T00:00:01.000Z", message: { role: "user", content: "SECRET GOAL", timestamp: 0 } } as SessionEntry,
-		{ type: "message", id: "done", parentId: "goal", timestamp: "2026-01-01T00:00:02.000Z", message: { role: "assistant", content: "x".repeat(8000), timestamp: 0 } } as unknown as SessionEntry,
+		{ type: "message", id: "done", parentId: "goal", timestamp: "2026-01-01T00:00:02.000Z", message: { role: "assistant", content: [{ type: "text", text: "x".repeat(8000) }], timestamp: 0 } } as unknown as SessionEntry,
 		{ type: "message", id: "current", parentId: "done", timestamp: "2026-01-01T00:00:03.000Z", message: { role: "user", content: "continue", timestamp: 0 } } as SessionEntry,
-		{ type: "message", id: "tail", parentId: "current", timestamp: "2026-01-01T00:00:04.000Z", message: { role: "assistant", content: "working", timestamp: 0 } } as unknown as SessionEntry,
+		{ type: "message", id: "tail", parentId: "current", timestamp: "2026-01-01T00:00:04.000Z", message: { role: "assistant", content: [{ type: "text", text: "working" }], timestamp: 0 } } as unknown as SessionEntry,
 	];
 	let prompt = "";
-	const operation = deps(config({ keepRecent: { mode: "tokens", value: 1 } }), async (value) => {
+	const operation = deps(config({ keepRecentTokens: 1 }), async (value) => {
 		prompt = renderPromptParts(value);
 		return VALID_SUMMARY;
 	}, branch);
@@ -184,6 +187,26 @@ test("automatic compaction starts at the first context-visible message after met
 	assert.ok(manual.state, manual.reason);
 });
 
+test("prompt state is never summarized and never covered by a block", async () => {
+	const branch: SessionEntry[] = [
+		{ type: "message", id: "prompt", parentId: null, timestamp: "2026-01-01T00:00:00.000Z", message: { role: "system", content: "", sections: { rules: "PROMPT-STATE".repeat(400) }, timestamp: 0 } } as unknown as SessionEntry,
+		{ type: "message", id: "goal", parentId: "prompt", timestamp: "2026-01-01T00:00:01.000Z", message: { role: "user", content: "SECRET GOAL", timestamp: 0 } } as SessionEntry,
+		{ type: "message", id: "done", parentId: "goal", timestamp: "2026-01-01T00:00:02.000Z", message: { role: "assistant", content: [{ type: "text", text: "x".repeat(8000) }], timestamp: 0 } } as unknown as SessionEntry,
+		{ type: "message", id: "current", parentId: "done", timestamp: "2026-01-01T00:00:03.000Z", message: { role: "user", content: "continue", timestamp: 0 } } as SessionEntry,
+		{ type: "message", id: "tail", parentId: "current", timestamp: "2026-01-01T00:00:04.000Z", message: { role: "assistant", content: [{ type: "text", text: "working" }], timestamp: 0 } } as unknown as SessionEntry,
+	];
+	let prompt = "";
+	const operation = deps(config({ keepRecentTokens: 1 }), async (value) => {
+		prompt = renderPromptParts(value);
+		return VALID_SUMMARY;
+	}, branch);
+	const automatic = await runAutoCompression(operation, freshState());
+	assert.ok(automatic.state, automatic.reason);
+	assert.equal(automatic.createdBlocks?.[0].startEntryId, "goal");
+	assert.equal(automatic.createdBlocks?.[0].endEntryId, "current");
+	assert.doesNotMatch(prompt, /PROMPT-STATE/);
+});
+
 test("summary request budget is checked before calling the model", async () => {
 	let called = false;
 	const operation = deps(config(), async () => {
@@ -192,7 +215,7 @@ test("summary request budget is checked before calling the model", async () => {
 	});
 	operation.contextWindow = 3000;
 	operation.referenceContext = "r".repeat(20_000);
-	const outcome = await runManualCompression(operation, freshState(), "e1", "e1");
+	const outcome = await runManualCompression(operation, freshState(), "e0", "e0");
 	assert.match(outcome.reason ?? "", /summary request needs/);
 	assert.equal(called, false);
 });
@@ -200,7 +223,7 @@ test("summary request budget is checked before calling the model", async () => {
 test("manual compaction rejects overlap and incomplete tail", async () => {
 	const state = await compactTurns(1);
 	assert.match((await runManualCompression(deps(), state, "e1", "e3")).reason ?? "", /overlaps/);
-	assert.match((await runManualCompression(deps(), state, "e11", "e11")).reason ?? "", /incomplete/);
+	assert.match((await runManualCompression(deps(), state, "e2", "e11")).reason ?? "", /incomplete/);
 });
 
 test("maxBlocks converges through mixed levels during long runs", async () => {
@@ -208,7 +231,7 @@ test("maxBlocks converges through mixed levels during long runs", async () => {
 	const branch = entries(12);
 	let state = freshState();
 	for (let turn = 1; turn <= 10; turn++) {
-		const startId = turn === 1 ? "e1" : `e${turn * 2 - 2}`;
+		const startId = turn === 1 ? "e0" : `e${turn * 2 - 2}`;
 		const endId = `e${turn * 2 - 1}`;
 		const outcome = await runManualCompression(deps(cfg, async () => VALID_SUMMARY, branch), state, startId, endId);
 		assert.ok(outcome.state, `turn ${turn}: ${outcome.reason}`);

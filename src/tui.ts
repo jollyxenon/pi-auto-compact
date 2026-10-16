@@ -1,14 +1,17 @@
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
+import type { CustomEntry, Theme } from "@earendil-works/pi-coding-agent";
 import {
+	Box,
 	Key,
 	matchesKey,
+	Text,
 	truncateToWidth,
 	type Component,
 	visibleWidth,
 	wrapTextWithAnsi,
 } from "@earendil-works/pi-tui";
 import type { CompressProgress } from "./compress.ts";
-import type { CompactBlock, PluginState } from "./types.ts";
+import type { CompactBlock, CompactSnapshotData, PluginState } from "./types.ts";
 
 export interface ProjectedContextUsage {
 	tokens: number;
@@ -37,6 +40,29 @@ export function showCompressionProgress(ctx: ExtensionContext, progress: Compres
 				: "auto-compact 正在压缩";
 	ctx.ui.setStatus(COMPRESSION_STATUS_KEY, `${label} ${bar} ${counts}${block}`);
 	ctx.ui.setWidget(COMPRESSION_STATUS_KEY, undefined);
+}
+
+/** Render the display-only compaction snapshot. Pi stores it as a CustomEntry, so it never
+ * contributes a model message; the current cards always come from the sidecar state. */
+export function renderCompactSnapshotEntry(
+	entry: CustomEntry<CompactSnapshotData>,
+	options: { expanded: boolean },
+	theme: Theme,
+): Component {
+	const data = entry.data;
+	const box = new Box(1, 1, (text) => theme.bg("customMessageBg", text));
+	if (!data) {
+		box.addChild(new Text(theme.fg("muted", "[auto-compact] 快照缺少数据"), 0, 0));
+		return box;
+	}
+	const retained = data.firstKeptEntryId ?? "(none)";
+	box.addChild(new Text(
+		`${theme.fg("accent", theme.bold("[auto-compact]"))} ${data.topLevelBlockIds.length} 个顶层块 · 保留起点 ${retained} · ${formatTokens(data.tokensBefore)} -> ${formatTokens(data.tokensAfter)} tokens`,
+		0,
+		0,
+	));
+	box.addChild(new Text(theme.fg("dim", options.expanded ? data.cardsText : "(展开查看完整卡片)"), 0, 0));
+	return box;
 }
 
 /** Install a compact native-style footer whose context figure uses the projected request. */
