@@ -72,6 +72,8 @@ export default function autoCompactExtension(pi: ExtensionAPI) {
 	}
 	let activeCompression: ActiveCompression | undefined;
 	let shuttingDown = false;
+	/** Whether this session already reported that Pi's own compaction trigger was declined. */
+	let nativeThresholdNotified = false;
 	let inputGuardUnsubscribe: (() => void) | undefined;
 
 	function debugLog(message: string, details?: unknown): void {
@@ -633,17 +635,29 @@ export default function autoCompactExtension(pi: ExtensionAPI) {
 		},
 	});
 
-	// Native /compact is deliberately disabled for manual requests. Automatic
-	// threshold and overflow requests run the same sliding plugin pass. While the
-	// plugin is installed, native compaction never runs: disabling plugin automation
-	// only stops the plugin scan and does not turn the native path back on.
+	// Pi's native compaction never runs while this plugin is installed. Manual /compact is refused
+	// outright, and Pi's threshold trigger is declined too: that trigger reads Pi's
+	// `compaction.reserveTokens` from settings.json, so honouring it lets a Pi setting decide when
+	// this plugin compresses and silently overrides `auto-compact.json`. The `context` handler runs
+	// the plugin's own `shouldCompact` check before every request and owns the trigger. Overflow is
+	// a real provider limit rather than a threshold preference, so it still runs the plugin pass.
 	pi.on("session_before_compact", async (event, ctx) => {
 		if (event.reason === "manual") {
 			if (ctx.hasUI) ctx.ui.notify("Pi 原生 /compact 已禁用；请使用 /auto-compact 或 compact_context。", "warning");
 			return { cancel: true };
 		}
 		if (!cfg.enabled) return { cancel: true };
-		// 插件始终接管 threshold/overflow 压缩；即使失败也取消原生行为，不回退原生 compact。
+		if (event.reason === "threshold") {
+			debugLog("native threshold compaction declined", { reserveTokens: cfg.reserveTokens });
+			if (!nativeThresholdNotified) {
+				nativeThresholdNotified = true;
+				if (ctx.hasUI) {
+					ctx.ui.notify(`Pi 原生压缩已由 pi-auto-compact 接管：本次原生阈值请求被忽略。压缩只在投影上下文超过“窗口 − ${cfg.reserveTokens}”时由插件触发；Pi 的 compaction 设置（settings.json 的 enabled / reserveTokens / keepRecentTokens）在插件启用期间不生效。`, "warning");
+				}
+			}
+			return { cancel: true };
+		}
+		// 插件接管 overflow 压缩；即使失败也取消原生行为，不回退原生 compact。
 		try {
 			const operationKey = currentSessionKey(ctx);
 			const outcome = await executeAutoCompression(ctx, event.branchEntries, event.signal, [], ctx.sessionManager.buildContextEntries(), operationKey);
@@ -715,6 +729,7 @@ export default function autoCompactExtension(pi: ExtensionAPI) {
 
 	pi.on("session_start", (event, ctx) => {
 		shuttingDown = false;
+		nativeThresholdNotified = false;
 		ensureSession(ctx);
 		footer?.dispose();
 		footer = installAutoCompactFooter(ctx, () => projectedUsage);
