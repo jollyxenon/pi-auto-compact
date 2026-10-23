@@ -7,7 +7,6 @@ import { Key, matchesKey } from "@earendil-works/pi-tui";
 import {
 	buildSessionContext,
 	calculateContextTokens,
-	estimateTokens,
 	getAgentDir,
 	shouldCompact,
 	type ExtensionAPI,
@@ -42,7 +41,7 @@ import {
 import { loadState, saveState, statePathFor } from "./state.ts";
 import { createSummarizeFn } from "./summaryClient.ts";
 import { freshState, SNAPSHOT_CUSTOM_TYPE, type CompactSnapshotData, type EntryMessageMapping, type PluginState } from "./types.ts";
-import { messageToText, renderBlockCard } from "./util.ts";
+import { estimateMessageTokens, messageToText, renderBlockCard } from "./util.ts";
 import {
 	blockTree,
 	choiceForm,
@@ -223,9 +222,11 @@ export default function autoCompactExtension(pi: ExtensionAPI) {
 		return -1;
 	}
 
-	/** Pi's context estimate: trust the last assistant usage and estimate only what follows it.
-	 * A context edit or a compression committed after that response invalidates the anchor, so the
-	 * whole projected request is estimated instead. */
+	/** Context estimate: trust the last assistant usage, which is provider-accurate, and measure only
+	 * what follows it. A context edit or a compression committed after that response invalidates the
+	 * anchor, so the whole projected request is estimated instead. Everything the plugin measures
+	 * itself uses the conservative prompt rate, never Pi's chars/4 rate, because CJK and tool output
+	 * tokenize 2-4x denser than chars/4 assumes. */
 	function estimateProjectedTokens(
 		visible: SessionEntry[],
 		rawMessages: AgentMessage[],
@@ -248,10 +249,10 @@ export default function autoCompactExtension(pi: ExtensionAPI) {
 			const position = projected.indexOf(message);
 			if (position < 0) break;
 			let tokens = calculateContextTokens(message.usage);
-			for (let next = position + 1; next < projected.length; next++) tokens += estimateTokens(projected[next]);
+			for (let next = position + 1; next < projected.length; next++) tokens += estimateMessageTokens(projected[next]);
 			return tokens;
 		}
-		return projected.reduce((sum, message) => sum + estimateTokens(message), 0);
+		return projected.reduce((sum, message) => sum + estimateMessageTokens(message), 0);
 	}
 
 	/** Recalculate the footer's context usage from the messages actually projected to the model. */
@@ -439,7 +440,9 @@ export default function autoCompactExtension(pi: ExtensionAPI) {
 				.map((message, index) => `[visible message ${index} ${message.role}]\n${messageToText(message, true)}`)
 				.join("\n\n"),
 			systemPrompt: ctx.getSystemPrompt(),
-			estimate: estimateTokens,
+			// Every plugin-side token number uses the same conservative prompt rate, so source weight,
+			// card budget, net gain and progress are comparable with the retained tail and the footer.
+			estimate: estimateMessageTokens,
 			supportsImages: ctx.model?.input?.includes("image") ?? false,
 			onProgress: (progress) => updateCompression(ctx, progress),
 			summarizeFn,

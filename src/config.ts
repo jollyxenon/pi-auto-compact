@@ -7,9 +7,9 @@ import { CONFIG_DIR_NAME, DEFAULT_COMPACTION_SETTINGS, getAgentDir } from "@eare
 export interface AutoCompactConfig {
 	/** Whether threshold and overflow requests should run automatic compaction. */
 	enabled: boolean;
-	/** Start automatic compaction once estimated context tokens exceed (window - reserveTokens). */
+	/** Start automatic compaction once the plugin's projected context estimate exceeds (window - reserveTokens). */
 	reserveTokens: number;
-	/** Recent conversation tokens kept verbatim; measured with Pi's estimateTokens. */
+	/** Recent conversation tokens kept verbatim; measured with the conservative prompt estimator. */
 	keepRecentTokens: number;
 	/** Maximum tokens in the complete card sent to the main model. */
 	blockTokenCeiling: number;

@@ -1,7 +1,7 @@
 /** Atomic hierarchical compaction operations. No function mutates its input state. */
 
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
-import { findCutPoint, sessionEntryToContextMessages, type SessionEntry } from "@earendil-works/pi-coding-agent";
+import { sessionEntryToContextMessages, type SessionEntry } from "@earendil-works/pi-coding-agent";
 import type { AutoCompactConfig } from "./config.ts";
 import { activeChildFrontier, activeTopBlocks } from "./mapping.ts";
 import {
@@ -17,6 +17,7 @@ import type { CompactBlock, PluginState, PromptPart, SummarizeInput } from "./ty
 import { SNAPSHOT_CUSTOM_TYPE } from "./types.ts";
 import {
 	entryToPromptParts,
+	estimateEntryTokens,
 	estimatePromptPartTokens,
 	estimatePromptTokens,
 	nextBlockId,
@@ -45,6 +46,7 @@ export interface CompressDeps {
 	referenceContext: string;
 	/** Active session system prompt; shown as read-only reference. */
 	systemPrompt: string;
+	/** Token rate for every plugin-side count: source weight, card budget, net gain and progress. */
 	estimate: TokenEstimator;
 	/** Whether the summary model accepts image input; otherwise images stay placeholders. */
 	supportsImages: boolean;
@@ -82,8 +84,9 @@ function cachedEntry(deps: CompressDeps, entry: SessionEntry): { parts: PromptPa
 	// for context_get, but project no model message and contribute no tokens either.
 	const conversation = messages.filter((message: AgentMessage) => message.role !== "system");
 	const parts = conversation.length === 0 ? [] : entryToPromptParts(entry, true, deps.supportsImages);
-	// Token accounting follows the conversation the block replaces — images cost Pi's fixed
-	// per-image estimate, not the size of their base64.
+	// Token accounting follows the conversation the block replaces, measured with the same
+	// conservative prompt rate as the retained tail and the footer — images cost a fixed per-image
+	// estimate, not the size of their base64.
 	const tokens = conversation.reduce((sum, message) => sum + deps.estimate(message), 0);
 	const value = { parts, tokens };
 	cache.set(entry.id, value);
@@ -692,11 +695,31 @@ interface AutoCandidateSearch {
 	minimumRequestTokens?: number;
 }
 
-/** Start of the retained tail, at Pi's own cut point. The plugin summarizes the same prefix Pi
- * would, so a split turn's prefix is folded into the leading block instead of a separate checkpoint. */
+/** Start of the retained tail, using Pi's cut-point policy with the conservative prompt estimator.
+ * Pi accumulates chars/4, which understates CJK and tool output by 2-4x, so a `keepRecentTokens`
+ * window measured that way retains far more real tokens than configured. The plugin summarizes the
+ * same prefix Pi would, so a split turn's prefix is folded into the leading block instead of a
+ * separate checkpoint. */
 function protectedStart(entries: SessionEntry[], keepTokens: number): number {
 	if (entries.length === 0) return 0;
-	return findCutPoint(entries, 0, entries.length, keepTokens).firstKeptEntryIndex;
+	const cutPoints: number[] = [];
+	for (let index = 0; index < entries.length; index++) {
+		if (isCutPointEntry(entries[index])) cutPoints.push(index);
+	}
+	if (cutPoints.length === 0) return 0;
+	let accumulated = 0;
+	let cutIndex = cutPoints[0];
+	for (let index = entries.length - 1; index >= 0; index--) {
+		const tokens = estimateEntryTokens(entries[index]);
+		if (tokens === 0) continue;
+		accumulated += tokens;
+		if (accumulated < keepTokens) continue;
+		cutIndex = cutPoints.find((candidate) => candidate >= index) ?? cutPoints[cutPoints.length - 1];
+		break;
+	}
+	// Metadata-only entries carry no model message, so the tail starts on the next real entry.
+	while (cutIndex > 0 && sessionEntryToContextMessages(entries[cutIndex - 1]).length === 0) cutIndex--;
+	return cutIndex;
 }
 
 /** Tool results are only valid when their matching tool call is in the same range.

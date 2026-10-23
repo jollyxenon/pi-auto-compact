@@ -1,7 +1,7 @@
 /** Session serialization, card rendering, and token helpers. */
 
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
-import type { SessionEntry } from "@earendil-works/pi-coding-agent";
+import { sessionEntryToContextMessages, type SessionEntry } from "@earendil-works/pi-coding-agent";
 import type { CompactBlock, PromptPart } from "./types.ts";
 
 export type TokenEstimator = (message: AgentMessage) => number;
@@ -114,6 +114,26 @@ export function estimatePromptPartTokens(parts: PromptPart[]): number {
 		(total, part) => total + (part.type === "image" ? IMAGE_PROMPT_TOKENS : estimatePromptTokens(part.text)),
 		0,
 	);
+}
+
+/**
+ * Conservative prompt-side cost of one projected message. The retained tail, the footer and the
+ * summary request budget all measure with this rate so no comparison mixes metric systems.
+ */
+export function estimateMessageTokens(message: AgentMessage): number {
+	if (message.role !== "system") return estimatePromptPartTokens(messageToPromptParts(message, true, true));
+	// Pi counts a system message as content plus prompt sections plus added tool definitions.
+	const sections = message.sections
+		? Object.values(message.sections).filter((section): section is string => typeof section === "string")
+		: [];
+	const toolsAdded = message.toolsAdded === undefined ? "" : JSON.stringify(message.toolsAdded);
+	return estimatePromptPartTokens(contentToPromptParts(message.content, true, true))
+		+ estimatePromptTokens(`${sections.join("")}${toolsAdded}`);
+}
+
+/** Conservative cost of the conversation one entry projects into the model request. */
+export function estimateEntryTokens(entry: SessionEntry): number {
+	return sessionEntryToContextMessages(entry).reduce((sum, message) => sum + estimateMessageTokens(message), 0);
 }
 
 /** Flatten prompt parts to text; image payloads never appear. */
