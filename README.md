@@ -5,9 +5,9 @@
 ## 行为
 
 - 在工具调用后的下一次模型请求前自动压缩，不中止正在执行的工具；可在 `/auto-compact-config` 中关闭自动压缩。
-- 安装并加载后，通过 `session_before_compact` 取消 Pi 原生压缩，不修改 `settings.json`。插件安装期间始终接管手动、threshold 和 overflow 压缩，即使插件压缩失败或没有可提交状态也取消原生行为，不回退到原生 compact；关闭自动压缩只停止插件的自动扫描，不放行原生压缩。
+- 安装并加载后，通过 `session_before_compact` 取消 Pi 原生压缩，不修改 `settings.json`。插件安装期间原生压缩从不运行：手动 `/compact` 直接拒绝，Pi 的阈值请求（`reason: "threshold"`）只取消、不压缩，因为它的阈值读的是 Pi 的 `settings.json`，照它执行就等于让 Pi 的设置决定插件何时压缩；触发完全由插件在 `context` 事件里的检查负责，`overflow` 是真实超窗，仍执行插件压缩。每个会话第一次忽略原生阈值请求时提示一次：Pi 原生压缩已被接管，Pi 的 `compaction` 设置不生效。关闭自动压缩只停止插件的自动扫描，不放行原生压缩。
 - 压缩只沿一条连续前缀推进：第一次从当前可见上下文的第一条参与 LLM context 的非 `system` 消息开始，之后从保留指针开始，绝不跳过中间未压缩内容；发现前部存在未压缩对话空隙时报告原因并保留原文，不以最后一个块尾作为前缀终点。前导的 `system` prompt state 与纯元数据 entry 可以留在前缀之外。
-- 触发与保留窗口沿用 Pi 原生压缩的 token 模型：`reserveTokens` 与 `keepRecentTokens` 都是绝对值。`context` 事件用 Pi 的 `shouldCompact` 判断（`contextTokens > window - reserveTokens`），保留段起点直接用 Pi 的 `findCutPoint`，两者都按 Pi 的 `estimateTokens` 计量，避免 provider 口径与 chars/4 口径混用。
+- 触发与保留窗口沿用 Pi 原生压缩的 token 模型：`reserveTokens` 与 `keepRecentTokens` 都是绝对值。`context` 事件用 Pi 的 `shouldCompact` 判断（`contextTokens > window - reserveTokens`），其中 `contextTokens` 是插件自己的投影估算；保留段起点用同一估算器重放 Pi 的切点策略。两者都用插件的保守提示词口径（`estimateMessageTokens`：CJK 约每字一 token，其余约每三字符一 token），不再沿用 Pi 的 `estimateTokens` / `findCutPoint`：它的 chars/4 在中文和工具输出上低估 2~4 倍，会让“保留 20000 token”实际留下远超配置的原文。provider 返回的 usage 只在可信时直接采用，不和估算混进同一次比较。
 - `blockMergeThreshold = k` 时，同一连续层级出现第 `k + 1` 个块后，最旧的 `k` 个块提升为一个更高层块。
 - 高层块只引用直接子块；每个块只记录原始范围的首尾 Entry ID，不保存或核验中间 Entry ID 序列；低层块和原始 session entry 不删除。
 - 块的首尾可以是不产生模型消息的 `custom` 等 entry。投影按完整 entry 区间定位其中实际存在的消息，不要求首尾 ID 直接对应模型消息；已有块无需重新摘要即可生效。
@@ -17,9 +17,9 @@
 - 当前活动顶层块从第一个块头到最后一个块尾形成压缩区。该区域只投影块卡片；其他扩展后来插入块内部或块间的普通消息会直接丢弃，不后移，也不进入摘要参考。但 `role: "system"` 的 prompt state 始终原样保留在投影里（Pi 用 compaction entry 回放系统提示词，插件只能保留原文）。压缩区之外的注入消息照常保留。
 - 恢复已有会话时，`/auto-compact` 会用同一分支的保留指针继续：先压缩最早能放入摘要请求的完整区间，生成的块随后作为参考上下文继续处理后续区间，直到保护尾部之前没有未压缩内容。已经由块表示的旧前缀不会重新摘要，已经追加的展示快照既不作为目标范围也不进入参考区。
 - 所有自动与手动压缩操作都会在编辑器上方显示实时 token 进度条；操作结束后原位置显示“压缩完成”和最新压缩块 ID、层级。失败时保留失败状态和已完成进度。
-- 插件接管 Pi footer 的上下文占用字段，按 Pi 的口径估算当前投影：优先信任最后一条 assistant usage，只对之后的消息追加 `estimateTokens`；出现 `context_edit` 或已提交的展示快照时该锚点失效，改为对投影整体估算。切换模型后，百分比与窗口上限立即按当前模型更新。累计 token、费用、目录、分支和模型信息仍保留。
+- 插件接管 Pi footer 的上下文占用字段：优先信任最后一条 assistant usage（provider 口径，直接采用），只对之后的消息追加 `estimateMessageTokens`；出现 `context_edit` 或已提交的展示快照时该锚点失效，改为对投影整体用同一保守口径估算。切换模型后，百分比与窗口上限立即按当前模型更新。累计 token、费用、目录、分支和模型信息仍保留。
 - `maxBlocks` 只约束一次操作完成后的稳定顶层投影；生成、连锁提升和持久化作为一次原子操作。
-- 最近对话由绝对量 `keepRecentTokens` 保护，自动压缩不会触碰当前未完成尾部；保留段起点与 Pi 原生压缩一致。
+- 最近对话由绝对量 `keepRecentTokens` 保护，自动压缩不会触碰当前未完成尾部；保留段起点沿用 Pi 的切点策略（有效切点、绝不切在 `toolResult`、扫描回退纯元数据 entry），但用插件的保守口径计量，所以保留的原文量按配置生效，而不是按 chars/4 生效。
 - 摘要使用当前会话模型和有效思考等级，通过 Pi 已注册提供方的 `streamSimple` 构造请求；不会因省略参数而把主对话的 `high` 等等级变成关闭思考。摘要仍是独立请求，保留 `cacheRetention: "none"`，不调用主对话的请求修改事件。
 - 摘要沿用 Pi `settings.json` 的 `retry.enabled`、`retry.maxRetries` 和 `retry.baseDelayMs`，默认对临时连接、限流和服务端错误最多重试 3 次，间隔为 2、4、8 秒；重试前显示通知。使用 Pi 的错误分类，不对笼统的 400、鉴权或额度耗尽错误盲目重试。只在完整请求层重试，底层 SDK 重试次数固定为 0，避免两层重试相乘。
 - 自动压缩从当前可见 session context 中的保留指针开始；系统提示词、AGENTS.md、工具描述和 Skill 描述由 Pi 单独管理，不属于 session entry。主会话系统提示词会作为只读参考传给摘要模型。摘要校验仍拒绝 `Goal`。
@@ -71,7 +71,7 @@ pi -e /home/xenon/pi-auto-compact
 }
 ```
 
-`reserveTokens` 和 `keepRecentTokens` 与 Pi 原生压缩的设置同名同义，都是绝对值，默认值取自 Pi 的 `DEFAULT_COMPACTION_SETTINGS`（16384 / 20000）：前者表示“窗口剩余多少 token 时开始压缩”，后者表示“最近多少 token 的对话保持原文”。两者都按 Pi 的 `estimateTokens` 计量，不再有百分比模式。
+`reserveTokens` 和 `keepRecentTokens` 与 Pi 原生压缩的设置同名同义，都是绝对值，默认值取自 Pi 的 `DEFAULT_COMPACTION_SETTINGS`（16384 / 20000）：前者表示“窗口剩余多少 token 时开始压缩”，后者表示“最近多少 token 的对话保持原文”。`blockTokenCeiling` 与 `minNetGainTokens` 是卡片预算和最低净收益。这四个值都按插件的保守提示词口径（`estimateMessageTokens`）计量，不再有百分比模式；默认 `blockTokenCeiling: 2000` 现在意味着卡片正文的实际提示词量级不超过约 2000 token（旧口径下同一数字实际放行到约 5400 token），所以如果你希望卡片保持原来的长度，应该把它调到 4000~6000。Pi 的 `settings.json` 里的 `compaction` 设置只在插件未接管前有效，插件启用期间不再决定触发时机或保留量。
 
 配置加载时校验，无效值直接报错：`reserveTokens`、`keepRecentTokens`、`blockTokenCeiling`、`defaultPageSize`、`maxPageSize`、`blockMergeThreshold` 和 `maxBlocks.value` 必须是正整数；`enabled`、`maxBlocks.enabled`、`debug` 必须是布尔值。项目配置里的 `maxBlocks` 按字段合并：只写 `{ "value": 8 }` 不会丢失全局的 `enabled`。
 
@@ -162,11 +162,11 @@ pi -e /home/xenon/pi-auto-compact
 
 上述三部分互不重叠，共同覆盖摘要所需当前投影。对于已经超过模型窗口的会话，插件按完整 entry 或完整块卡片缩小参考区；原始完整内容仍保留在 session JSONL 中。
 
-图片在摘要请求里按原始位置以图片块发送，因此按图片计费而不是按 base64 计费；只有当前模型不支持图片输入时才退化为 `[image <mime>, about <大小>KB omitted]` 占位符。`context_get` 的文本形式始终用占位符，原始数据用 `rawEntryJson`。不产生模型消息的 entry（例如其他扩展写入的 `custom` 展示记录、`model_change`、`thinking_level_change`）不是摘要素材：它们仍留在块的头尾区间内，`context_get` 照样能按区间取回，但正文 JSON 不出现在目标区或参考区——这些记录 Pi 在正常对话里也不会发给模型。entry 的 token 记账（`sourceTokens`、受保护尾部、净收益、进度）按 Pi 的消息投影计算，图片按 Pi 的固定每图估算计费；摘要请求预算按实际提示词内容（含图片块）估算，且对中文等 CJK 文字和密集代码/JSON 采用偏保守的每字口径（CJK 约每字一 token，其余约每三字符一 token）。两者口径不同是刻意的：窗口校验宁可高估请求。这是启发式近似，不保证与提供方分词器完全一致，但可以避免 chars/4 在中文/代码内容上把超窗请求当成“放得下”。
+图片在摘要请求里按原始位置以图片块发送，因此按图片计费而不是按 base64 计费；只有当前模型不支持图片输入时才退化为 `[image <mime>, about <大小>KB omitted]` 占位符。`context_get` 的文本形式始终用占位符，原始数据用 `rawEntryJson`。不产生模型消息的 entry（例如其他扩展写入的 `custom` 展示记录、`model_change`、`thinking_level_change`）不是摘要素材：它们仍留在块的头尾区间内，`context_get` 照样能按区间取回，但正文 JSON 不出现在目标区或参考区——这些记录 Pi 在正常对话里也不会发给模型。entry 的 token 记账按 Pi 的消息投影计算（排除不产生模型消息的 entry），计量一律用保守提示词口径（CJK 约每字一 token，其余约每三字符一 token）：`sourceTokens`、卡片预算、净收益门限、进度、受保护尾部和 footer 全部同口径，图片按固定每图估算计费。摘要请求预算同样按实际提示词内容（含图片块）用这个口径估算。这是启发式近似，不保证与提供方分词器完全一致，但可以避免 chars/4 在中文/代码内容上把超窗请求当成“放得下”。
 
 范围选择与请求发送共同使用 `max(2 * blockTokenCeiling, 2048)` 作为输出预留；实际请求还受模型输出上限约束。思考与摘要合计不能超过这一上限；范围选择额外预留 Pi 适配器的 4096 token 输入余量和 256 token 重写余量。level-1 因净收益要求而缩小卡片预算时，不会错误地同步缩小请求输出预留。模型达到输出上限而未正常结束时，仍拒绝提交，不硬截断摘要。
 
-摘要采用固定输出协议：模型先生成不超过 50 字符的一句话概述，供 `/auto-compact-blocks` 的树视图显示；随后生成 `<progress>`（含 `<done>`、`<doing>`、`<todo>`）、`<blocked>`、`<decision>`、`<critical_content>`、`<read_files>`、`<modified_files>` 组成的详细压缩块。两者在同一次模型请求中生成，概述只写入块元数据，不进入投影给模型的块卡片。level-1 完整卡片预算同时受 `blockTokenCeiling` 和 `minNetGainTokens` 约束，确保生成结果达到最低净收益；第一次输出不合格时重写一次，仍不合格则整次操作回滚。插件不会硬截断摘要。
+摘要采用固定输出协议：模型先生成不超过 50 字符的一句话概述，供 `/auto-compact-blocks` 的树视图显示；随后生成 `<progress>`（含 `<done>`、`<doing>`、`<todo>`）、`<blocked>`、`<decision>`、`<critical_content>`、`<read_files>`、`<modified_files>` 组成的详细压缩块。两者在同一次模型请求中生成，概述只写入块元数据，不进入投影给模型的块卡片。level-1 完整卡片预算同时受 `blockTokenCeiling` 和 `minNetGainTokens` 约束，两者都按保守提示词口径（`estimateMessageTokens`）计量：`blockTokenCeiling: 2000` 意味着卡片正文的实际提示词量级不超过约 2000 token，而不再是被 chars/4 放大后的约 5400 token。确保生成结果达到最低净收益；第一次输出不合格时重写一次，仍不合格则整次操作回滚。插件不会硬截断摘要。
 
 ## 状态与故障语义
 
@@ -180,7 +180,7 @@ pi -e /home/xenon/pi-auto-compact
 
 每次有效状态变化还会在会话末尾追加一条 `custom` 展示快照（`auto-compact-snapshot`）。它是派生展示记录，不是有效状态的一部分：丢失、写入失败或不存在都不影响投影和下一次压缩，插件也不会用它恢复块树。展示快照因而不参与模型上下文、摘要目标、参考材料和 token 记账。
 
-插件取消 Pi 原生压缩，并始终接管手动、threshold 和 overflow 压缩；即使插件没有产出可提交状态（例如收益不足、摘要失败或请求预算不足）也取消原生行为，不回退到原生 compact。关闭自动压缩只停止插件的阈值扫描，不会因此放行原生压缩。插件等待摘要期间会阻止另一轮插件压缩并发启动，避免 session leaf 改变后丢弃结果。压缩进行中，`tree`/`fork`/`clone`/`new`/`resume` 会被取消，`/reload` 会在输入层被拦截；按下 Esc（包括空闲时发起的 `/auto-compact`）或退出（session_shutdown）会中断摘要请求及重试等待，并丢弃未提交的部分结果。若配置让受保护尾部本身接近或超过模型窗口，自动压缩将找不到可处理区间；此时应降低 `keepRecent` 或 `trigger`，再执行 `/auto-compact-config`。
+插件取消 Pi 原生压缩，并始终接管手动、threshold 和 overflow 压缩；即使插件没有产出可提交状态（例如收益不足、摘要失败或请求预算不足）也取消原生行为，不回退到原生 compact。`threshold` 请求只取消、不压缩：Pi 的阈值读的是 `settings.json` 的 `compaction.reserveTokens`，照它执行就等于让 Pi 的设置决定插件何时压缩、并让 `auto-compact.json` 的 `reserveTokens` 失效。触发完全由插件在 `context` 事件里的检查负责；每个会话第一次忽略原生阈值请求时提示一次。`overflow` 是真实超窗，仍执行插件压缩。关闭自动压缩只停止插件的阈值扫描，不会因此放行原生压缩。插件等待摘要期间会阻止另一轮插件压缩并发启动，避免 session leaf 改变后丢弃结果。压缩进行中，`tree`/`fork`/`clone`/`new`/`resume` 会被取消，`/reload` 会在输入层被拦截；按下 Esc（包括空闲时发起的 `/auto-compact`）或退出（session_shutdown）会中断摘要请求及重试等待，并丢弃未提交的部分结果。若配置让受保护尾部本身接近或超过模型窗口，自动压缩将找不到可处理区间；此时应降低 `keepRecent` 或 `trigger`，再执行 `/auto-compact-config`。
 
 ## 摘要请求排查
 
