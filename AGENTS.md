@@ -23,7 +23,7 @@ npm pack --dry-run
 - 摘要、全部连锁提升和 sidecar 写入成功后才能替换内存状态。
 - 摘要通过当前注册提供方的 `streamSimple` 继承 `ctx.thinkingLevel`，认证、请求构造与压缩状态机分离；使用 Pi 的 `retryAssistantCall` 和受信任设置中的重试策略，不另写错误分类或双层重试。请求及重试等待共用操作取消信号，终止摘要与未完成输出不得提交。
 - 摘要提示词按原始位置携带真实图片块，只有当前模型不支持图片时才退化为 `[image <mime>, about <大小>KB omitted]` 占位符；`context_get` 文本始终用占位符，base64 不进任何提示词。不产生模型消息的 entry（`custom` 展示记录、`model_change`、`thinking_level_change` 等）不是摘要素材：它们仍留在块的头尾区间内供 `context_get` 取回，但正文 JSON 不进入 `TARGET_RANGE` 或 `REFERENCE_CONTEXT`。`system` 消息同理：只算 prompt state，不计入可压缩对话，也不进入 `TARGET_RANGE` 或 `REFERENCE_CONTEXT`。entry token 记账走 Pi 的消息投影（`sessionEntryToContextMessages`，排除 `system`），计量一律用插件的保守提示词口径 `estimateMessageTokens`（CJK 约每字一 token，其余约每三字符一 token），不再用 Pi 的 chars/4：`sourceTokens`、卡片预算、净收益门限、进度、受保护尾部和 footer 全部同口径。摘要请求预算同样按实际提示词内容用这个保守口径估算，不沿用 Pi 对拉丁文本的 chars/4，减少窗口校验放行实际超窗请求的机会；该估算仍是启发式近似，不保证与提供方分词器一致。
-- 摘要选段预算与实际请求共用 `summaryOutputTokenLimit`；较小的 level-1 卡片预算不能缩小真实输出预留。提供方附加的思考预算必须纳入输出上限，输入预算保留 Pi 适配器余量。调试日志记录模型、有效思考等级、token 估算、尝试次数、耗时和错误，不主动记录提示词、正文或认证信息。
+- 摘要选段预算与实际请求共用 `summaryOutputTokenLimit`；较小的 level-1 卡片预算不能缩小真实输出预留。提供方附加的思考预算必须纳入输出上限，输入预算保留 Pi 适配器余量；重写请求是本次操作的最后一次请求，只保留适配器余量，不叠加重写余量，否则第一次请求刚好放下的目标范围会被重写指令判为超窗。调试日志记录模型、有效思考等级、token 估算、尝试次数、耗时和错误，不主动记录提示词、正文或认证信息。
 - `REFERENCE_CONTEXT` 与 `TARGET_RANGE` 不重复，二者合起来覆盖摘要所需当前上下文。
 - 压缩块禁止 `Goal`，完整卡片不得超过 `blockTokenCeiling`（按 `estimateMessageTokens` 计量，即卡片的真实提示词量级），摘要不得硬截断。
 - `context_get` 必须校验当前活动分支并分页；`rawEntryJson` 保留完整 Pi `SessionEntry` 字段。

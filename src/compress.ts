@@ -125,8 +125,12 @@ interface PreparedInput {
 	fits: boolean;
 }
 
-// Match Pi's streamSimple input safety margin, plus room for a structural rewrite.
-const SUMMARY_REWRITE_RESERVE = 4096 + 256;
+// Pi's streamSimple clamps maxTokens against contextWindow - CONTEXT_SAFETY_TOKENS, so every
+// request estimate mirrors that 4096-token input margin. A first attempt additionally leaves room
+// for the structural rewrite, because the rewrite resends the same content plus a longer
+// instruction; the rewrite itself is the last request of the operation and needs no further room.
+const SUMMARY_ADAPTER_MARGIN = 4096;
+const SUMMARY_REWRITE_RESERVE = 256;
 
 /** Stop an operation before it can produce or commit a result. */
 function throwIfAborted(deps: CompressDeps): void {
@@ -231,12 +235,14 @@ export function resolveCompactedPrefix(entries: SessionEntry[], state: PluginSta
 	return { retainedFrom, firstKeptEntryId: entries[retainedFrom]?.id };
 }
 
-/** Reserve enough room for the generated card and one structural rewrite. */
-function summaryRequestTokensForParts(deps: CompressDeps, parts: PromptPart[]): number {
+/** Estimate one summary request: the adapter margin always applies, and a first attempt also
+ * carries the rewrite reserve so the follow-up request still fits the window. */
+function summaryRequestTokensForParts(deps: CompressDeps, parts: PromptPart[], mayRewrite = true): number {
 	return estimatePromptTokens(SUMMARIZER_SYSTEM_PROMPT)
 		+ estimatePromptPartTokens(parts)
 		+ summaryOutputTokenLimit(deps.cfg.blockTokenCeiling)
-		+ SUMMARY_REWRITE_RESERVE;
+		+ SUMMARY_ADAPTER_MARGIN
+		+ (mayRewrite ? SUMMARY_REWRITE_RESERVE : 0);
 }
 
 /** Estimate the complete request that would be sent to the summary model. */
@@ -404,7 +410,7 @@ async function summarizeBlock(
 	let problems = [...parsed.problems, ...validation.problems];
 	if (problems.length > 0) {
 		const rewriteContent: PromptPart[] = [...content, { type: "text", text: rewriteInstruction({ problems }) }];
-		const rewriteRequestTokens = summaryRequestTokensForParts(deps, rewriteContent);
+		const rewriteRequestTokens = summaryRequestTokensForParts(deps, rewriteContent, false);
 		if (rewriteRequestTokens > deps.contextWindow) {
 			return { error: `summary rewrite needs about ${rewriteRequestTokens} tokens, window is ${deps.contextWindow}` };
 		}
