@@ -11,6 +11,8 @@ export interface CompactToolDeps {
 	commitState: (state: PluginState, ctx: ExtensionContext, expectedSessionKey?: string) => void;
 	/** Append the display-only snapshot for a committed state. */
 	appendSnapshot: (state: PluginState, ctx: ExtensionContext) => void;
+	/** Record provider usage from the summary requests this operation completed. */
+	appendSummaryUsage: (ctx: ExtensionContext) => void;
 	beginCompression: (ctx: ExtensionContext) => void;
 	buildCompressDeps: (
 		ctx: ExtensionContext,
@@ -52,6 +54,7 @@ export function makeCompactTool(deps: CompactToolDeps) {
 					const outcome = await runManualCompression(operation, deps.getState(ctx), params.startId, params.endId, params.focus);
 					if (!outcome.state) throw new Error(outcome.reason ?? "Compaction failed.");
 					deps.commitState(outcome.state, ctx, operation.sessionKey);
+					deps.appendSummaryUsage(ctx);
 					deps.appendSnapshot(outcome.state, ctx);
 					deps.finishCompression(ctx, outcome);
 					return result(describe(outcome.createdBlocks ?? []));

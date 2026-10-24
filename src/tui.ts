@@ -1,5 +1,5 @@
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
-import type { CustomEntry, Theme } from "@earendil-works/pi-coding-agent";
+import type { CustomEntry, SessionEntry, Theme } from "@earendil-works/pi-coding-agent";
 import {
 	Box,
 	Key,
@@ -11,7 +11,7 @@ import {
 	wrapTextWithAnsi,
 } from "@earendil-works/pi-tui";
 import type { CompressProgress } from "./compress.ts";
-import type { CompactBlock, CompactSnapshotData, PluginState } from "./types.ts";
+import { SUMMARY_USAGE_CUSTOM_TYPE, type CompactBlock, type CompactSnapshotData, type PluginState, type SummaryUsage } from "./types.ts";
 
 export interface ProjectedContextUsage {
 	tokens: number;
@@ -85,15 +85,24 @@ export function installAutoCompactFooter(
 					let cacheRead = 0;
 					let cacheWrite = 0;
 					let cost = 0;
-					for (const entry of ctx.sessionManager.getEntries()) {
-						if (entry.type !== "message" || entry.message.role !== "assistant") continue;
-						const usage = entry.message.usage;
-						if (!usage) continue;
+					const add = (usage: Extract<SessionEntry, { type: "usage" }>["usage"] | undefined): void => {
+						if (!usage) return;
 						input += usage.input;
 						output += usage.output;
 						cacheRead += usage.cacheRead;
 						cacheWrite += usage.cacheWrite;
 						cost += usage.cost.total;
+					};
+					// The same sources Pi's own footer totals: assistant replies, usage records (cache
+					// warming), nested tool work, summaries, plus the plugin's own recorded summary usage.
+					// Counting only assistant replies would understate the session totals.
+					for (const entry of ctx.sessionManager.getEntries()) {
+						if (entry.type === "message") {
+							if (entry.message.role === "assistant") add(entry.message.usage);
+							else if (entry.message.role === "toolResult") add(entry.message.usage);
+						} else if (entry.type === "usage") add(entry.usage);
+						else if (entry.type === "branch_summary" || entry.type === "compaction") add(entry.usage);
+						else if (entry.type === "custom" && entry.customType === SUMMARY_USAGE_CUSTOM_TYPE) add((entry.data as SummaryUsage | undefined)?.usage);
 					}
 
 					const branch = footerData.getGitBranch();

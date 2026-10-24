@@ -1,5 +1,6 @@
 /** Immutable compact blocks plus the current top-level forest. */
 
+import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import type { ImageContent, TextContent } from "@earendil-works/pi-ai";
 
 /** Ordered prompt content; images stay image parts so provider adapters attach them. */
@@ -42,6 +43,16 @@ export interface PluginState {
 	firstKeptEntryIdByBranch?: Record<string, string>;
 	nextSeq: number;
 }
+
+/** Provider-reported usage from one completed summary request. */
+export interface SummaryUsage {
+	provider: string;
+	model: string;
+	usage: Extract<AgentMessage, { role: "assistant" }>["usage"];
+}
+
+/** Custom entry type recording provider usage from one completed summary request. */
+export const SUMMARY_USAGE_CUSTOM_TYPE = "auto-compact-usage";
 
 /** Custom entry type used for the display-only summary appended after each change. */
 export const SNAPSHOT_CUSTOM_TYPE = "auto-compact-snapshot";

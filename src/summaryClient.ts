@@ -4,7 +4,7 @@ import { normalizeContext, retryAssistantCall } from "@earendil-works/pi-ai";
 import { getAgentDir, SettingsManager, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { AutoCompactConfig } from "./config.ts";
 import { SUMMARIZER_SYSTEM_PROMPT, summaryOutputTokenLimit } from "./summarizer.ts";
-import type { PromptPart } from "./types.ts";
+import type { PromptPart, SummaryUsage } from "./types.ts";
 import { estimatePromptPartTokens, estimatePromptTokens } from "./util.ts";
 
 /** Capture one operation's model settings; resolve authentication afresh on each attempt. */
@@ -13,6 +13,7 @@ export function createSummarizeFn(
 	cfg: AutoCompactConfig,
 	signal: AbortSignal | undefined,
 	debugLog: (message: string, details?: unknown) => void,
+	onUsage: (entry: SummaryUsage) => void,
 ): ((content: PromptPart[]) => Promise<string>) | null {
 	const selected = ctx.model;
 	if (!selected) return null;
@@ -67,6 +68,9 @@ export function createSummarizeFn(
 						maxRetryDelayMs: providerRetry.maxRetryDelayMs,
 					},
 				).result();
+				// Report usage as soon as a response completes: the tokens are spent even when the
+				// output later fails validation, and the retry wrapper never repeats a completed call.
+				onUsage({ provider: model.provider, model: result.responseModel ?? model.id, usage: result.usage });
 				debugLog("summary request finished", {
 					...request, attempt: attempts, elapsedMs: Date.now() - started,
 					stopReason: result.stopReason, usage: result.usage, error: result.errorMessage,

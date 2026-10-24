@@ -39,7 +39,7 @@ import {
 } from "./mapping.ts";
 import { loadState, saveState, statePathFor } from "./state.ts";
 import { createSummarizeFn } from "./summaryClient.ts";
-import { freshState, SNAPSHOT_CUSTOM_TYPE, type CompactSnapshotData, type EntryMessageMapping, type PluginState } from "./types.ts";
+import { freshState, SNAPSHOT_CUSTOM_TYPE, SUMMARY_USAGE_CUSTOM_TYPE, type CompactSnapshotData, type EntryMessageMapping, type PluginState, type SummaryUsage } from "./types.ts";
 import { estimateMessageTokens, messageToText, renderBlockCard } from "./util.ts";
 import {
 	blockTree,
@@ -70,6 +70,8 @@ export default function autoCompactExtension(pi: ExtensionAPI) {
 	let lastCompressionProgress: CompressProgress | undefined;
 	/** Projected context usage captured when the current operation started. */
 	let projectedBeforeOperation: number | undefined;
+	/** Usage from summary requests completed during the current operation; drained at commit time. */
+	let pendingSummaryUsage: SummaryUsage[] = [];
 	interface ActiveCompression {
 		controller: AbortController;
 		cleanup: () => void;
@@ -283,6 +285,7 @@ export default function autoCompactExtension(pi: ExtensionAPI) {
 	/** Start, update, and finish the shared compression status line. */
 	function beginCompression(ctx: ExtensionContext): void {
 		lastCompressionProgress = { phase: "starting", compressedTokens: 0, totalTokens: 0 };
+		pendingSummaryUsage = [];
 		refreshProjectedUsage(ctx);
 		projectedBeforeOperation = projectedUsage?.tokens;
 		const entries = sourceEntriesFor(ctx.sessionManager.buildContextEntries());
@@ -360,6 +363,35 @@ export default function autoCompactExtension(pi: ExtensionAPI) {
 	}
 
 	/**
+	 * Record provider-reported usage for every summary request that completed during this operation.
+	 * Pi stores the usage of its own compaction and of cache warming in a `usage` entry, but an
+	 * extension has no API for that entry type, so the record is a plugin-owned `custom` entry that
+	 * stays out of the model context. Without it the summary cost is invisible in the footer.
+	 * Appending advances the session leaf, so callers run this only after the last session-path
+	 * check, right before the display snapshot.
+	 */
+	function appendSummaryUsage(ctx: ExtensionContext): void {
+		if (pendingSummaryUsage.length === 0) return;
+		const pending = pendingSummaryUsage;
+		pendingSummaryUsage = [];
+		try {
+			for (const entry of pending) pi.appendEntry<SummaryUsage>(SUMMARY_USAGE_CUSTOM_TYPE, entry);
+			sessionLeafId = ctx.sessionManager.getLeafId();
+			debugLog("summary usage recorded", pending.map((entry) => ({
+				provider: entry.provider,
+				model: entry.model,
+				input: entry.usage.input,
+				output: entry.usage.output,
+				cacheRead: entry.usage.cacheRead,
+				cacheWrite: entry.usage.cacheWrite,
+				cost: entry.usage.cost.total,
+			})));
+		} catch (error) {
+			debugLog("summary usage append failed", { error: error instanceof Error ? error.message : String(error) });
+		}
+	}
+
+	/**
 	 * Append the display-only snapshot for a committed state. Pi stores it as a CustomEntry, so it
 	 * never becomes a model message and current cards still come from the sidecar. Appending advances
 	 * the session leaf, so callers run this only after the last real session-path check.
@@ -434,7 +466,7 @@ export default function autoCompactExtension(pi: ExtensionAPI) {
 		ensureSession(ctx);
 		const usage = ctx.getContextUsage();
 		const contextWindow = usage?.contextWindow ?? ctx.model?.contextWindow ?? 0;
-		const summarizeFn = createSummarizeFn(ctx, cfg, signal, debugLog);
+		const summarizeFn = createSummarizeFn(ctx, cfg, signal, debugLog, (entry) => pendingSummaryUsage.push(entry));
 		if (!summarizeFn || contextWindow <= 0) return null;
 		return {
 			cfg,
@@ -520,6 +552,7 @@ export default function autoCompactExtension(pi: ExtensionAPI) {
 			try {
 				const outcome = await executeAutoCompression(ctx);
 				if (outcome.state) {
+					appendSummaryUsage(ctx);
 					appendSnapshot(ctx, outcome.state);
 					ctx.ui.notify(`已完成自动压缩，生成或提升 ${outcome.createdBlocks?.length ?? 0} 个块`, "info");
 				} else {
@@ -563,6 +596,7 @@ export default function autoCompactExtension(pi: ExtensionAPI) {
 						const outcome = await runTreeMerge(deps, state, selected.parentId, selectedIds);
 						if (!outcome.state) throw new Error(outcome.reason);
 						commitState(outcome.state, ctx, deps.sessionKey);
+						appendSummaryUsage(ctx);
 						appendSnapshot(ctx, outcome.state);
 						finishCompression(ctx, outcome);
 					} catch (error) {
@@ -585,6 +619,7 @@ export default function autoCompactExtension(pi: ExtensionAPI) {
 					const outcome = await runTreeSplit(deps, state, selected.parentId, block.blockId);
 					if (!outcome.state) throw new Error(outcome.reason);
 					commitState(outcome.state, ctx, deps.sessionKey);
+					appendSummaryUsage(ctx);
 					appendSnapshot(ctx, outcome.state);
 					finishCompression(ctx, outcome);
 				} catch (error) {
@@ -700,7 +735,10 @@ export default function autoCompactExtension(pi: ExtensionAPI) {
 		try {
 			const operationKey = currentSessionKey(ctx);
 			const outcome = await executeAutoCompression(ctx, event.branchEntries, event.signal, [], ctx.sessionManager.buildContextEntries(), operationKey);
-			if (outcome.state) appendSnapshot(ctx, outcome.state);
+			if (outcome.state) {
+				appendSummaryUsage(ctx);
+				appendSnapshot(ctx, outcome.state);
+			}
 			if (outcome.status === "error" && ctx.hasUI) {
 				ctx.ui.notify(`auto-compact: ${outcome.reason ?? "压缩失败"}，旧上下文保持不变`, "error");
 			}
@@ -870,7 +908,8 @@ export default function autoCompactExtension(pi: ExtensionAPI) {
 				),
 			};
 			renderFooter();
-			// The request messages already exist; only now may the display record move the leaf.
+			// Both records move the leaf; only now, after the last path check, may they be appended.
+			appendSummaryUsage(ctx);
 			if (outcome?.state) appendSnapshot(ctx, state);
 			return { messages: refreshedProjected };
 		} catch (error) {
@@ -892,6 +931,7 @@ export default function autoCompactExtension(pi: ExtensionAPI) {
 		runExclusive,
 		finishCompression,
 		failCompression,
+		appendSummaryUsage,
 		appendSnapshot: (next: PluginState, ctx: ExtensionContext) => appendSnapshot(ctx, next),
 	};
 	pi.registerEntryRenderer<CompactSnapshotData>(SNAPSHOT_CUSTOM_TYPE, renderCompactSnapshotEntry);
