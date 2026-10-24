@@ -1,8 +1,11 @@
 /** Strict summary protocol shared by automatic and manual operations. */
 
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
+import type { Tool, ToolCall } from "@earendil-works/pi-ai";
+import { Type, type Static } from "typebox";
+import { Value } from "typebox/value";
 import type { PromptPart, SummarizeInput } from "./types.ts";
-import { nextBlockId, renderBlockCard, type TokenEstimator } from "./util.ts";
+import { estimatePromptTokens, nextBlockId, renderBlockCard, type TokenEstimator } from "./util.ts";
 
 export const SUMMARIZER_SYSTEM_PROMPT =
 	"You are requested to compress the context of this session. Compress according to the format specifications provided below.";
@@ -12,22 +15,47 @@ export function summaryOutputTokenLimit(blockTokenCeiling: number): number {
 	return Math.max(blockTokenCeiling * 2, 2048);
 }
 
-/** Structural tags the compaction body must contain, in this exact order. */
-export const REQUIRED_STRUCTURE_TAGS = [
-	"<progress>",
-	"<done>",
-	"<doing>",
-	"<todo>",
-	"</progress>",
-	"<blocked>",
-	"<decision>",
-	"<critical_content>",
-	"<read_files>",
-	"<modified_files>",
-] as const;
-
 /** One-sentence overview length limit used by the compaction protocol. */
 export const OVERVIEW_MAX_CHARS = 50;
+
+/**
+ * JSON shape of one compaction block. There is no Goal field on purpose: a compact block
+ * cannot carry a goal because goals belong to the live session, not to summarized history.
+ * Only keywords every provider accepts are used, so the schema stays usable under strict
+ * JSON-schema constrained sampling.
+ */
+export const SUMMARY_SCHEMA = Type.Object({
+	overview: Type.String({ description: "One-line title of this block." }),
+	progress: Type.Object({
+		done: Type.Array(Type.String({ description: "One completed affair." })),
+		doing: Type.Array(Type.String({ description: "The last ongoing affair." })),
+		todo: Type.Array(Type.String({ description: "One affair to carry out after the ongoing one." })),
+	}),
+	blocked: Type.Array(Type.String({ description: "One affair that could not be executed." })),
+	decision: Type.Array(Type.String({ description: "One decision on an open problem, naming its decision-maker." })),
+	critical_content: Type.Array(Type.String({ description: "One fact important for later thinking and decisions." })),
+	read_files: Type.Array(Type.String({ description: "One file path read in the target range." })),
+	modified_files: Type.Array(Type.String({ description: "One file path edited or written in the target range." })),
+});
+
+export type CompactSummaryOutput = Static<typeof SUMMARY_SCHEMA>;
+
+export const SUMMARY_TOOL_NAME = "emit_compaction_block";
+
+/**
+ * The summary arrives as one schema-constrained tool call instead of free text, so the
+ * provider validates the shape before the plugin ever reads it. `prefer` keeps providers
+ * without strict JSON-schema support working through the same tool.
+ */
+export const SUMMARY_TOOL: Tool = {
+	name: SUMMARY_TOOL_NAME,
+	description: "Emit the compaction block for the target range exactly once. Never answer with text.",
+	parameters: SUMMARY_SCHEMA,
+	constrainedSampling: { type: "json_schema", strict: "prefer" },
+};
+
+/** Input cost of the tool declaration, charged to every summary request budget. */
+export const SUMMARY_TOOL_TOKENS = estimatePromptTokens(JSON.stringify(SUMMARY_TOOL));
 
 /** Assemble the summary request; target and reference images stay in their positions. */
 export function buildSummarizeParts(input: SummarizeInput): PromptPart[] {
@@ -50,51 +78,25 @@ function instructionBlock(input: SummarizeInput): string {
 
 - The reference context is ONLY used to understand the task situation and DOES NOT enter the generated compression block;
 - When compressing, ONLY summarize the affairs that occur in the target compaction range and DO NOT expand the compression range outward;
-- The compaction block structure MUST conform to the given format;
-- Overview is limited to one sentence, not exceeding ${OVERVIEW_MAX_CHARS} characters;
-- The compressed block output in the final format should not exceed ${input.budgetTokens} Token.
+- Report the result by calling the \`${SUMMARY_TOOL_NAME}\` tool exactly once; NEVER answer with text and NEVER wrap the call in a code fence;
+- \`overview\` is limited to one sentence, not exceeding ${OVERVIEW_MAX_CHARS} characters;
+- The emitted compaction block should not exceed ${input.budgetTokens} Token.
 
 ## Compaction Block Structure
 
-The content you output should only have compaction blocks, starting from \`<overview>\` and ending at \`</modified_files>\`; STRICTLY follow the format specifications and DO NOT include ANY irrelevant content.
+Call \`${SUMMARY_TOOL_NAME}\` once with these fields:
 
-\`\`\`compaction_structure
-<overview>
-As a title display, a one sentence overview.
-</overview>
+- \`overview\`: a title for this block, one sentence, at most ${OVERVIEW_MAX_CHARS} characters;
+- \`progress.done\`: affairs completed in the target compaction range, one per item;
+- \`progress.doing\`: the last ongoing affair in the target compaction range, one per item;
+- \`progress.todo\`: affairs to carry out after that ongoing affair, one per item;
+- \`blocked\`: affairs that were intended but could not be executed within the target compaction range due to certain reasons, one per item;
+- \`decision\`: decisions made on open problems during task execution within the target compaction range, one per item, naming the user or the assistant as the decision-maker;
+- \`critical_content\`: content that plays an important role in thinking and decision-making within the target compaction range, one per item;
+- \`read_files\`: file paths read within the target compaction range, one per item;
+- \`modified_files\`: file paths edited or written within the target compaction range, one per item.
 
-<progress>
-<done>
-Completed affairs in the target compaction range. List by points.
-</done>
-<doing>
-The last ongoing affair in the target compaction range. List by points.
-</doing>
-<todo>
-The affair that should be carried out after the end of the last ongoing affair in the target compaction range. List by points.
-</todo>
-</progress>
-
-<blocked>
-A affair that was intended to be executed but could not be executed within the target compaction range due to certain reasons. List by points.
-</blocked>
-
-<decision>
-Decisions made on open problems during task execution within the target compaction range. List by points. Please indicate whether the decision-maker is the user or the assistant.
-</decision>
-
-<critical_content>
-The content that plays an important role in thinking and decision-making within the target compaction range. List by points.
-</critical_content>
-
-<read_files>
-The file path read within the target compaction range. List by points.
-</read_files>
-
-<modified_files>
-The file path for editing and writing within the target compaction range. List by points.
-</modified_files>
-\`\`\`
+Every field is required. Use an empty array when there is nothing to report, and never invent content that the target range does not contain.
 
 ## Content that Needs to Be Compressed
 
@@ -115,24 +117,82 @@ ${input.systemPrompt}
 `;
 }
 
-export interface ParsedSummaryResponse {
-	overview: string;
-	summary: string;
+export interface ParsedSummaryOutput {
+	output?: CompactSummaryOutput;
 	problems: string[];
 }
 
-/** Split the model response into tree overview and context-card summary. */
-export function parseSummaryResponse(response: string): ParsedSummaryResponse {
-	const match = /^<overview>\s*\n([^\r\n]+)\n<\/overview>\s*\n([\s\S]+)$/.exec(response.trim());
-	if (!match) return { overview: "", summary: response.trim(), problems: ["missing exact overview block"] };
-	const overview = match[1].trim();
-	const problems: string[] = [];
-	if (!overview) problems.push("overview is empty");
-	if (overview.length > OVERVIEW_MAX_CHARS) {
-		problems.push(`overview exceeds ${OVERVIEW_MAX_CHARS} characters`);
+/** Read the schema-constrained tool call, falling back to a JSON object written as text. */
+export function parseSummaryOutput(toolCalls: ToolCall[], text: string): ParsedSummaryOutput {
+	const call = toolCalls.find((item) => item.name === SUMMARY_TOOL_NAME);
+	if (call?.argumentsError) {
+		return { problems: [`the ${SUMMARY_TOOL_NAME} call carried malformed JSON arguments`] };
 	}
-	if (/[\r\n]/.test(overview)) problems.push("overview must be one line");
-	return { overview, summary: match[2].trim(), problems };
+	const raw = call ? call.arguments : extractJsonObject(text);
+	if (raw === undefined) {
+		return {
+			problems: [
+				call
+					? `the ${SUMMARY_TOOL_NAME} call carried no arguments`
+					: `the response contains neither a ${SUMMARY_TOOL_NAME} call nor a JSON object`,
+			],
+		};
+	}
+	const problems: string[] = [];
+	for (const error of Value.Errors(SUMMARY_SCHEMA, raw)) {
+		problems.push(`${error.instancePath || "root"}: ${error.message}`);
+		if (problems.length >= 5) break;
+	}
+	if (problems.length > 0) return { problems };
+	const output = raw as CompactSummaryOutput;
+	if (!output.overview.trim()) problems.push("overview is empty");
+	if (output.overview.length > OVERVIEW_MAX_CHARS) problems.push(`overview exceeds ${OVERVIEW_MAX_CHARS} characters`);
+	if (/[\r\n]/.test(output.overview)) problems.push("overview must be one line");
+	return problems.length > 0 ? { problems } : { output, problems };
+}
+
+/** First `{` to last `}` of the response; the tolerant path for providers without tool support. */
+function extractJsonObject(text: string): unknown {
+	const start = text.indexOf("{");
+	const end = text.lastIndexOf("}");
+	if (start < 0 || end <= start) return undefined;
+	try {
+		return JSON.parse(text.slice(start, end + 1));
+	} catch {
+		return undefined;
+	}
+}
+
+/** Render the fixed card text from the structured output; the shape is guaranteed here. */
+export function renderSummaryCard(output: CompactSummaryOutput): string {
+	const section = (tag: string, items: string[]): string[] => [`<${tag}>`, bulletList(items), `</${tag}>`];
+	return [
+		"<progress>",
+		"<done>",
+		bulletList(output.progress.done),
+		"</done>",
+		"<doing>",
+		bulletList(output.progress.doing),
+		"</doing>",
+		"<todo>",
+		bulletList(output.progress.todo),
+		"</todo>",
+		"</progress>",
+		"",
+		...section("blocked", output.blocked),
+		"",
+		...section("decision", output.decision),
+		"",
+		...section("critical_content", output.critical_content),
+		"",
+		...section("read_files", output.read_files),
+		"",
+		...section("modified_files", output.modified_files),
+	].join("\n");
+}
+
+function bulletList(items: string[]): string {
+	return (items.length > 0 ? items : ["(none)"]).map((item) => `- ${item}`).join("\n");
 }
 
 export interface SummaryValidation {
@@ -141,34 +201,18 @@ export interface SummaryValidation {
 	problems: string[];
 }
 
-/** Validate structure, explicit Goal exclusion, and final card size. */
-export function validateSummary(summary: string, cardTokens: number, budgetTokens: number): SummaryValidation {
-	const problems: string[] = [];
-	const trimmed = summary.trim();
-	if (!trimmed) problems.push("summary is empty");
-	if (/^\s{0,3}#{1,6}\s+Goal\b/im.test(trimmed)) problems.push("Goal is not allowed in compact blocks");
-	if (trimmed && !trimmed.startsWith("<progress>")) problems.push("summary must start with <progress>");
-	let lastIndex = -1;
-	for (const tag of REQUIRED_STRUCTURE_TAGS) {
-		const index = trimmed.indexOf(tag);
-		if (index < 0) {
-			problems.push(`missing ${tag}`);
-			continue;
-		}
-		if (index < lastIndex) problems.push(`${tag} out of order`);
-		lastIndex = Math.max(lastIndex, index + tag.length);
-	}
-	const modifiedEnd = trimmed.indexOf("</modified_files>");
-	if (modifiedEnd >= 0 && trimmed.slice(modifiedEnd + "</modified_files>".length).trim()) {
-		problems.push("content after </modified_files> is not allowed");
-	}
+/** Validate the rendered card against its budget; the block shape is guaranteed by the schema. */
+export function validateSummaryCard(cardTokens: number, budgetTokens: number): SummaryValidation {
 	const overBudget = cardTokens > budgetTokens;
-	if (overBudget) problems.push(`card uses ${cardTokens} tokens, limit is ${budgetTokens}`);
-	return { ok: problems.length === 0, overBudget, problems };
+	return {
+		ok: !overBudget,
+		overBudget,
+		problems: overBudget ? [`card uses ${cardTokens} tokens, limit is ${budgetTokens}`] : [],
+	};
 }
 
-export function rewriteInstruction(validation: SummaryValidation | { problems: string[] }): string {
-	return `\n\nThe previous output was invalid (${validation.problems.join("; ")}). Rewrite the entire response once, including a one-line <overview> block and the exact compaction block structure; remove Goal and fit the card budget.`;
+export function rewriteInstruction(problems: string[]): string {
+	return `\n\nThe previous output was invalid (${problems.join("; ")}). Call the \`${SUMMARY_TOOL_NAME}\` tool once with the complete compaction block: fill every field, keep \`overview\` to one line of at most ${OVERVIEW_MAX_CHARS} characters, and stay inside the card budget. Do not answer with text.`;
 }
 
 /** Estimate the final visible card using the real message estimator. */

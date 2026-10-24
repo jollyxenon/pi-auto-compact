@@ -1,7 +1,7 @@
 /** Immutable compact blocks plus the current top-level forest. */
 
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
-import type { ImageContent, TextContent } from "@earendil-works/pi-ai";
+import type { ImageContent, TextContent, ToolCall } from "@earendil-works/pi-ai";
 
 /** Ordered prompt content; images stay image parts so provider adapters attach them. */
 export type PromptPart = TextContent | ImageContent;
@@ -49,6 +49,12 @@ export interface SummaryUsage {
 	provider: string;
 	model: string;
 	usage: Extract<AgentMessage, { role: "assistant" }>["usage"];
+}
+
+/** One completed summary response: the tool call is authoritative, text is the fallback. */
+export interface SummaryResponse {
+	text: string;
+	toolCalls: ToolCall[];
 }
 
 /** Custom entry type recording provider usage from one completed summary request. */

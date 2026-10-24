@@ -1,10 +1,10 @@
 /** Model requests for summaries, using Pi's provider adapters and retry policy. */
 
-import { normalizeContext, retryAssistantCall } from "@earendil-works/pi-ai";
+import { normalizeContext, retryAssistantCall, type ToolCall } from "@earendil-works/pi-ai";
 import { getAgentDir, SettingsManager, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { AutoCompactConfig } from "./config.ts";
-import { SUMMARIZER_SYSTEM_PROMPT, summaryOutputTokenLimit } from "./summarizer.ts";
-import type { PromptPart, SummaryUsage } from "./types.ts";
+import { SUMMARIZER_SYSTEM_PROMPT, SUMMARY_TOOL, SUMMARY_TOOL_TOKENS, summaryOutputTokenLimit } from "./summarizer.ts";
+import type { PromptPart, SummaryResponse, SummaryUsage } from "./types.ts";
 import { estimatePromptPartTokens, estimatePromptTokens } from "./util.ts";
 
 /** Capture one operation's model settings; resolve authentication afresh on each attempt. */
@@ -14,7 +14,7 @@ export function createSummarizeFn(
 	signal: AbortSignal | undefined,
 	debugLog: (message: string, details?: unknown) => void,
 	onUsage: (entry: SummaryUsage) => void,
-): ((content: PromptPart[]) => Promise<string>) | null {
+): ((content: PromptPart[]) => Promise<SummaryResponse>) | null {
 	const selected = ctx.model;
 	if (!selected) return null;
 	const provider = ctx.modelRegistry.getProvider(selected.provider);
@@ -30,15 +30,16 @@ export function createSummarizeFn(
 	const maxTokens = Math.min(selected.maxTokens, summaryOutputTokenLimit(cfg.blockTokenCeiling));
 	const model = { ...selected, maxTokens };
 
-	return async (content: PromptPart[]): Promise<string> => {
-		// Provider-level `streamSimple` takes Pi's TranscriptContext: the system prompt is folded
-		// into a leading system message, exactly as Pi's own summarization does.
+	return async (content: PromptPart[]): Promise<SummaryResponse> => {
+		// Provider-level `streamSimple` takes Pi's TranscriptContext: the system prompt and the
+		// summary tool are folded into a leading system message, exactly as Pi's own calls do.
 		const context = normalizeContext({
 			systemPrompt: SUMMARIZER_SYSTEM_PROMPT,
+			tools: [SUMMARY_TOOL],
 			messages: [{ role: "user" as const, content, timestamp: Date.now() }],
 		});
 		// Same estimator as the planner's budget, so the reported input and the window check agree.
-		const inputTokens = estimatePromptTokens(SUMMARIZER_SYSTEM_PROMPT) + estimatePromptPartTokens(content);
+		const inputTokens = estimatePromptTokens(SUMMARIZER_SYSTEM_PROMPT) + SUMMARY_TOOL_TOKENS + estimatePromptPartTokens(content);
 		const request = { provider: model.provider, model: model.id, api: model.api, reasoning, inputTokens, maxTokens };
 		let attempts = 0;
 		const started = Date.now();
@@ -74,6 +75,9 @@ export function createSummarizeFn(
 				debugLog("summary request finished", {
 					...request, attempt: attempts, elapsedMs: Date.now() - started,
 					stopReason: result.stopReason, usage: result.usage, error: result.errorMessage,
+					// Shape only: the plugin never writes summary content into the debug log.
+					toolCalls: result.content.filter((block) => block.type === "toolCall").map((block) => block.name),
+					malformedArguments: result.content.some((block) => block.type === "toolCall" && block.argumentsError !== undefined),
 				});
 				return result;
 			}, retry, signal, {
@@ -83,16 +87,18 @@ export function createSummarizeFn(
 				},
 			});
 			if (signal?.aborted || response.stopReason === "aborted") throw new Error("compression aborted");
-			if (response.stopReason !== "stop") {
+			// A schema-constrained summary ends as `toolUse`; only the text fallback ends as `stop`.
+			if (response.stopReason !== "stop" && response.stopReason !== "toolUse") {
 				throw new Error(`summary model ended with ${response.stopReason}${response.errorMessage ? `: ${response.errorMessage}` : ""}`);
 			}
-			if (response.content.some((block) => block.type === "toolCall")) {
-				throw new Error("summary model returned a tool call instead of a summary");
-			}
-			return response.content
-				.filter((block): block is Extract<(typeof response.content)[number], { type: "text" }> => block.type === "text")
-				.map((block) => block.text)
-				.join("\n");
+			const toolCalls = response.content.filter((block): block is ToolCall => block.type === "toolCall");
+			return {
+				text: response.content
+					.filter((block): block is Extract<(typeof response.content)[number], { type: "text" }> => block.type === "text")
+					.map((block) => block.text)
+					.join("\n"),
+				toolCalls,
+			};
 		} catch (error) {
 			debugLog("summary request failed", {
 				...request, attempts, elapsedMs: Date.now() - started,

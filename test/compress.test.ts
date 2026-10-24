@@ -9,47 +9,33 @@ import {
 	type CompressDeps,
 } from "../src/compress.ts";
 import type { AutoCompactConfig } from "../src/config.ts";
-import { freshState, type PluginState, type PromptPart } from "../src/types.ts";
+import { SUMMARY_TOOL_NAME } from "../src/summarizer.ts";
+import { freshState, type PluginState, type PromptPart, type SummaryResponse } from "../src/types.ts";
 import { messageToText, renderPromptParts, type TokenEstimator } from "../src/util.ts";
 
 /** 与 Pi 的 estimateTokens 同规则（chars/4），内联以便测试自己掌握契约。 */
 const testEstimator: TokenEstimator = (message) => Math.max(1, Math.ceil(messageToText(message).length / 4));
 
-const VALID_SUMMARY = `<overview>
-完成了所选历史工作的压缩，并保留后续继续所需的信息。
-</overview>
+const VALID_OUTPUT = {
+	overview: "完成了所选历史工作的压缩，并保留后续继续所需的信息。",
+	progress: {
+		done: ["Completed the selected historical work."],
+		doing: ["None"],
+		todo: ["Continue with the recent context."],
+	},
+	blocked: ["None"],
+	decision: ["Scope: only the target range was summarized. (user)"],
+	critical_content: ["Original entries remain retrievable."],
+	read_files: [],
+	modified_files: [],
+};
 
-<progress>
-<done>
-- [x] Completed the selected historical work.
-</done>
-<doing>
-- [ ] None
-</doing>
-<todo>
-- Continue with the recent context.
-</todo>
-</progress>
-
-<blocked>
-- None
-</blocked>
-
-<decision>
-- Scope: only the target range was summarized. (user)
-</decision>
-
-<critical_content>
-- Original entries remain retrievable.
-</critical_content>
-
-<read_files>
-(none)
-</read_files>
-
-<modified_files>
-(none)
-</modified_files>`;
+function summaryResponse(): SummaryResponse {
+	return {
+		text: "",
+		toolCalls: [{ type: "toolCall", id: "call-1", name: SUMMARY_TOOL_NAME, arguments: VALID_OUTPUT }],
+	};
+}
 
 function entries(turns = 5): SessionEntry[] {
 	const result: SessionEntry[] = [];
@@ -93,7 +79,7 @@ function config(overrides: Partial<AutoCompactConfig> = {}): AutoCompactConfig {
 
 function deps(
 	cfg = config(),
-	summarizeFn: (content: PromptPart[]) => Promise<string> = async () => VALID_SUMMARY,
+	summarizeFn: (content: PromptPart[]) => Promise<SummaryResponse> = async () => summaryResponse(),
 	branchEntries = entries(),
 ): CompressDeps {
 	return {
@@ -157,7 +143,7 @@ test("a merge summary failure leaves the input state unchanged", async () => {
 	let calls = 0;
 	const failing = deps(config(), async () => {
 		calls++;
-		if (calls === 1) return VALID_SUMMARY;
+		if (calls === 1) return summaryResponse();
 		throw new Error("merge model failed");
 	});
 	await assert.rejects(runManualCompression(failing, state, "e6", "e7"), /merge model failed/);
@@ -175,7 +161,7 @@ test("automatic compaction starts at the first context-visible message after met
 	let prompt = "";
 	const operation = deps(config({ keepRecent: { mode: "tokens", value: 1 } }), async (value) => {
 		prompt = renderPromptParts(value);
-		return VALID_SUMMARY;
+		return summaryResponse();
 	}, branch);
 	const automatic = await runAutoCompression(operation, freshState());
 	assert.ok(automatic.state, automatic.reason);
@@ -198,7 +184,7 @@ test("prompt state is never summarized and never covered by a block", async () =
 	let prompt = "";
 	const operation = deps(config({ keepRecent: { mode: "tokens", value: 1 } }), async (value) => {
 		prompt = renderPromptParts(value);
-		return VALID_SUMMARY;
+		return summaryResponse();
 	}, branch);
 	const automatic = await runAutoCompression(operation, freshState());
 	assert.ok(automatic.state, automatic.reason);
@@ -211,7 +197,7 @@ test("summary request budget is checked before calling the model", async () => {
 	let called = false;
 	const operation = deps(config(), async () => {
 		called = true;
-		return VALID_SUMMARY;
+		return summaryResponse();
 	});
 	operation.contextWindow = 3000;
 	operation.referenceContext = "r".repeat(20_000);
@@ -233,7 +219,7 @@ test("maxBlocks converges through mixed levels during long runs", async () => {
 	for (let turn = 1; turn <= 10; turn++) {
 		const startId = turn === 1 ? "e0" : `e${turn * 2 - 2}`;
 		const endId = `e${turn * 2 - 1}`;
-		const outcome = await runManualCompression(deps(cfg, async () => VALID_SUMMARY, branch), state, startId, endId);
+		const outcome = await runManualCompression(deps(cfg, async () => summaryResponse(), branch), state, startId, endId);
 		assert.ok(outcome.state, `turn ${turn}: ${outcome.reason}`);
 		state = outcome.state;
 		assert.ok(state.topLevelBlockIds.length <= 2);

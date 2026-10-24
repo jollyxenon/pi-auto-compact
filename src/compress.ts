@@ -6,14 +6,17 @@ import { resolveTokenLimit, type AutoCompactConfig } from "./config.ts";
 import { activeChildFrontier, activeTopBlocks } from "./mapping.ts";
 import {
 	SUMMARIZER_SYSTEM_PROMPT,
+	SUMMARY_TOOL_TOKENS,
 	buildSummarizeParts,
 	cardTokensFor,
-	parseSummaryResponse,
+	parseSummaryOutput,
+	renderSummaryCard,
 	rewriteInstruction,
 	summaryOutputTokenLimit,
-	validateSummary,
+	validateSummaryCard,
+	type CompactSummaryOutput,
 } from "./summarizer.ts";
-import type { CompactBlock, PluginState, PromptPart, SummarizeInput } from "./types.ts";
+import type { CompactBlock, PluginState, PromptPart, SummarizeInput, SummaryResponse } from "./types.ts";
 import { SNAPSHOT_CUSTOM_TYPE } from "./types.ts";
 import {
 	entryToPromptParts,
@@ -51,7 +54,7 @@ export interface CompressDeps {
 	/** Whether the summary model accepts image input; otherwise images stay placeholders. */
 	supportsImages: boolean;
 	onProgress?: (progress: CompressProgress) => void;
-	summarizeFn: (content: PromptPart[]) => Promise<string>;
+	summarizeFn: (content: PromptPart[]) => Promise<SummaryResponse>;
 	/** Per-operation memo of an entry's prompt parts and the tokens its messages cost. */
 	entryCache?: Map<string, { parts: PromptPart[]; tokens: number }>;
 	/** Abort signal shared by every model request in this operation. */
@@ -239,6 +242,7 @@ export function resolveCompactedPrefix(entries: SessionEntry[], state: PluginSta
  * carries the rewrite reserve so the follow-up request still fits the window. */
 function summaryRequestTokensForParts(deps: CompressDeps, parts: PromptPart[], mayRewrite = true): number {
 	return estimatePromptTokens(SUMMARIZER_SYSTEM_PROMPT)
+		+ SUMMARY_TOOL_TOKENS
 		+ estimatePromptPartTokens(parts)
 		+ summaryOutputTokenLimit(deps.cfg.blockTokenCeiling)
 		+ SUMMARY_ADAPTER_MARGIN
@@ -391,6 +395,14 @@ function prepareInput(
 }
 
 
+/** One validated summary: the rendered card plus the overview that only the block tree shows. */
+interface SummaryRead {
+	output?: CompactSummaryOutput;
+	card?: string;
+	cardTokens?: number;
+	problems: string[];
+}
+
 async function summarizeBlock(
 	deps: CompressDeps,
 	state: PluginState,
@@ -402,38 +414,41 @@ async function summarizeBlock(
 	if (firstRequestTokens > deps.contextWindow) {
 		return { error: `summary request needs about ${firstRequestTokens} tokens, window is ${deps.contextWindow}` };
 	}
-	let response = (await deps.summarizeFn(content)).trim();
+	// Validate the schema-constrained output and the rendered card; the card shape itself is
+	// produced by the renderer, so only the output contract and the budget can fail here.
+	const read = (response: SummaryResponse): SummaryRead => {
+		const parsed = parseSummaryOutput(response.toolCalls, response.text);
+		if (!parsed.output) return { problems: parsed.problems };
+		const card = renderSummaryCard(parsed.output);
+		const cardTokens = cardTokensFor(state.nextSeq, input, card, deps.estimate);
+		return { output: parsed.output, card, cardTokens, problems: validateSummaryCard(cardTokens, input.budgetTokens).problems };
+	};
+	let summary = read(await deps.summarizeFn(content));
 	throwIfAborted(deps);
-	let parsed = parseSummaryResponse(response);
-	let cardTokens = cardTokensFor(state.nextSeq, input, parsed.summary, deps.estimate);
-	let validation = validateSummary(parsed.summary, cardTokens, input.budgetTokens);
-	let problems = [...parsed.problems, ...validation.problems];
-	if (problems.length > 0) {
-		const rewriteContent: PromptPart[] = [...content, { type: "text", text: rewriteInstruction({ problems }) }];
+	if (summary.problems.length > 0) {
+		const rewriteContent: PromptPart[] = [...content, { type: "text", text: rewriteInstruction(summary.problems) }];
 		const rewriteRequestTokens = summaryRequestTokensForParts(deps, rewriteContent, false);
 		if (rewriteRequestTokens > deps.contextWindow) {
 			return { error: `summary rewrite needs about ${rewriteRequestTokens} tokens, window is ${deps.contextWindow}` };
 		}
-		response = (await deps.summarizeFn(rewriteContent)).trim();
+		summary = read(await deps.summarizeFn(rewriteContent));
 		throwIfAborted(deps);
-		parsed = parseSummaryResponse(response);
-		cardTokens = cardTokensFor(state.nextSeq, input, parsed.summary, deps.estimate);
-		validation = validateSummary(parsed.summary, cardTokens, input.budgetTokens);
-		problems = [...parsed.problems, ...validation.problems];
 	}
-	if (problems.length > 0) return { error: problems.join("; ") };
+	if (summary.problems.length > 0 || !summary.output || summary.card === undefined || summary.cardTokens === undefined) {
+		return { error: summary.problems.join("; ") };
+	}
 	return {
 		block: {
 			blockId: nextBlockId(state.nextSeq),
 			level: input.level,
-			overview: parsed.overview,
+			overview: summary.output.overview.trim(),
 			startEntryId: input.sourceEntryIds[0] ?? "",
 			endEntryId: input.sourceEntryIds.at(-1) ?? "",
 			childBlockIds: [...input.childBlockIds],
-			summary: parsed.summary,
+			summary: summary.card,
 			createdAt: new Date().toISOString(),
 			sourceTokens: input.sourceTokens,
-			cardTokens,
+			cardTokens: summary.cardTokens,
 		},
 	};
 }
