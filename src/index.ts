@@ -8,7 +8,6 @@ import {
 	buildSessionContext,
 	calculateContextTokens,
 	getAgentDir,
-	shouldCompact,
 	type ExtensionAPI,
 	type ExtensionContext,
 	type SessionEntry,
@@ -27,7 +26,7 @@ import {
 	type CompressOutcome,
 	type CompressProgress,
 } from "./compress.ts";
-import { defaultConfig, loadConfig, saveConfig, type AutoCompactConfig } from "./config.ts";
+import { defaultConfig, loadConfig, resolveTokenLimit, saveConfig, type AutoCompactConfig, type TokenLimit } from "./config.ts";
 import { makeContextGetTool } from "./contextGet.ts";
 import {
 	activeChildFrontier,
@@ -51,6 +50,11 @@ import {
 	type ChoiceItem,
 	type ProjectedContextUsage,
 } from "./tui.ts";
+
+/** Human-readable form of a token limit, used in notices and log lines. */
+function describeTokenLimit(limit: TokenLimit): string {
+	return limit.mode === "percent" ? `${Math.round(limit.value * 100)}% 窗口` : `${limit.value} token`;
+}
 
 export default function autoCompactExtension(pi: ExtensionAPI) {
 	const cfg = defaultConfig();
@@ -603,10 +607,41 @@ export default function autoCompactExtension(pi: ExtensionAPI) {
 			if (!ctx.hasUI) return;
 			try {
 				reloadConfig(ctx);
+				// The form shows percent limits as 0-100 for typing comfort while the JSON file stores a
+				// 0-1 window share, so the unit row must stay next to its value row.
+				const presets = {
+					trigger: { percent: ["60", "70", "80", "85", "90"], tokens: ["100000", "150000", "200000"] },
+					keepRecent: { percent: ["10", "15", "20", "25", "30"], tokens: ["10000", "20000", "40000"] },
+				};
+				const limitItems = (prefix: "trigger" | "keepRecent", label: string, limit: TokenLimit): ChoiceItem[] => {
+					const mode = limit.mode === "percent" ? "百分比" : "绝对值";
+					const values = presets[prefix][limit.mode];
+					return [
+						{
+							id: `${prefix}Mode`,
+							label: `${label}单位`,
+							value: mode,
+							values: ["百分比", "绝对值"],
+							onChange: (item, all) => {
+								const value = all.find((candidate) => candidate.id === `${prefix}Value`);
+								if (!value) return;
+								value.values = presets[prefix][item.value === "百分比" ? "percent" : "tokens"];
+								value.value = value.values[0] ?? value.value;
+							},
+						},
+						{
+							id: `${prefix}Value`,
+							label: `${label}数值`,
+							value: limit.mode === "percent" ? String(Math.round(limit.value * 100)) : String(limit.value),
+							values,
+							editable: true,
+						},
+					];
+				};
 				const items: ChoiceItem[] = [
 					{ id: "enabled", label: "自动压缩", value: cfg.enabled ? "开启" : "关闭", values: ["开启", "关闭"] },
-					{ id: "reserveTokens", label: "触发前预留 token", value: String(cfg.reserveTokens), values: ["16384", "32768", "77400"], editable: true },
-					{ id: "keepRecentTokens", label: "保留最近 token", value: String(cfg.keepRecentTokens), values: ["10000", "20000", "40000"], editable: true },
+					...limitItems("trigger", "触发阈值", cfg.trigger),
+					...limitItems("keepRecent", "保留最近内容", cfg.keepRecent),
 					{ id: "blockTokenCeiling", label: "压缩块上限", value: String(cfg.blockTokenCeiling), values: ["1000", "2000", "4000", "8000"], editable: true },
 					{ id: "blockMergeThreshold", label: "连续块合并数量", value: String(cfg.blockMergeThreshold), values: ["2", "3", "4", "5"], editable: true },
 					{ id: "maxBlocksEnabled", label: "顶层块数量限制", value: cfg.maxBlocks.enabled ? "开启" : "关闭", values: ["开启", "关闭"] },
@@ -616,11 +651,15 @@ export default function autoCompactExtension(pi: ExtensionAPI) {
 				const result = await choiceForm(ctx, "auto-compact 设置", items, (changed) => changed);
 				if (!result) return;
 				const get = (id: string) => result.find((item) => item.id === id)?.value ?? "";
+				const limit = (prefix: "trigger" | "keepRecent"): TokenLimit => {
+					const raw = Number(get(`${prefix}Value`));
+					return get(`${prefix}Mode`) === "百分比" ? { mode: "percent", value: raw / 100 } : { mode: "tokens", value: raw };
+				};
 				const next: AutoCompactConfig = {
 					...cfg,
 					enabled: get("enabled") === "开启",
-					reserveTokens: Number(get("reserveTokens")),
-					keepRecentTokens: Number(get("keepRecentTokens")),
+					trigger: limit("trigger"),
+					keepRecent: limit("keepRecent"),
 					blockTokenCeiling: Number(get("blockTokenCeiling")),
 					blockMergeThreshold: Number(get("blockMergeThreshold")),
 					maxBlocks: { enabled: get("maxBlocksEnabled") === "开启", value: Number(get("maxBlocksValue")) },
@@ -638,8 +677,8 @@ export default function autoCompactExtension(pi: ExtensionAPI) {
 	// Pi's native compaction never runs while this plugin is installed. Manual /compact is refused
 	// outright, and Pi's threshold trigger is declined too: that trigger reads Pi's
 	// `compaction.reserveTokens` from settings.json, so honouring it lets a Pi setting decide when
-	// this plugin compresses and silently overrides `auto-compact.json`. The `context` handler runs
-	// the plugin's own `shouldCompact` check before every request and owns the trigger. Overflow is
+	// this plugin compresses and silently overrides `auto-compact.json`. The `context` handler owns
+	// the trigger and compares the projected estimate against `cfg.trigger` itself. Overflow is
 	// a real provider limit rather than a threshold preference, so it still runs the plugin pass.
 	pi.on("session_before_compact", async (event, ctx) => {
 		if (event.reason === "manual") {
@@ -648,11 +687,11 @@ export default function autoCompactExtension(pi: ExtensionAPI) {
 		}
 		if (!cfg.enabled) return { cancel: true };
 		if (event.reason === "threshold") {
-			debugLog("native threshold compaction declined", { reserveTokens: cfg.reserveTokens });
+			debugLog("native threshold compaction declined", { trigger: cfg.trigger });
 			if (!nativeThresholdNotified) {
 				nativeThresholdNotified = true;
 				if (ctx.hasUI) {
-					ctx.ui.notify(`Pi 原生压缩已由 pi-auto-compact 接管：本次原生阈值请求被忽略。压缩只在投影上下文超过“窗口 − ${cfg.reserveTokens}”时由插件触发；Pi 的 compaction 设置（settings.json 的 enabled / reserveTokens / keepRecentTokens）在插件启用期间不生效。`, "warning");
+					ctx.ui.notify(`Pi 原生压缩已由 pi-auto-compact 接管：本次原生阈值请求被忽略。压缩只由插件自己的触发阈值（当前 ${describeTokenLimit(cfg.trigger)}）决定；Pi 的 compaction 设置（settings.json 的 enabled / reserveTokens / keepRecentTokens）在插件启用期间不生效。`, "warning");
 				}
 			}
 			return { cancel: true };
@@ -779,18 +818,24 @@ export default function autoCompactExtension(pi: ExtensionAPI) {
 		if (window <= 0) return { messages: projected };
 		projectedUsage = { tokens: estimateProjectedTokens(visible, event.messages, mapping, projected, blocks) };
 		renderFooter();
+		// Percent limits are shares of the window, so they are resolved here, per request: the window
+		// follows the active model. A window the provider does not report leaves percent limits
+		// unresolvable, which the early return above already turns into "do not compact".
+		const triggerTokens = resolveTokenLimit(cfg.trigger, window);
 		const compactSource = sourceEntriesFor(visible);
 		debugLog("context projected", {
 			projectedTokens: projectedUsage.tokens,
 			window,
-			reserveTokens: cfg.reserveTokens,
-			keepRecentTokens: cfg.keepRecentTokens,
+			trigger: cfg.trigger,
+			triggerTokens,
+			keepRecent: cfg.keepRecent,
+			keepRecentTokens: resolveTokenLimit(cfg.keepRecent, window),
 			messageCount: event.messages.length,
 			cards: blocks.length,
 			retainedEntries: compactSource.length - resolveCompactedPrefix(compactSource, state).retainedFrom,
 			excludedSnapshots: visible.filter((entry) => isSnapshotEntry(entry)).length,
 		});
-		if (!shouldCompact(projectedUsage.tokens, window, cfg)) return { messages: projected };
+		if (projectedUsage.tokens <= triggerTokens) return { messages: projected };
 
 		const additionalMessages = outsideInjected;
 		const operationKey = currentSessionKey(ctx);

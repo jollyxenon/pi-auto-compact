@@ -2,7 +2,7 @@
 
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import { sessionEntryToContextMessages, type SessionEntry } from "@earendil-works/pi-coding-agent";
-import type { AutoCompactConfig } from "./config.ts";
+import { resolveTokenLimit, type AutoCompactConfig } from "./config.ts";
 import { activeChildFrontier, activeTopBlocks } from "./mapping.ts";
 import {
 	SUMMARIZER_SYSTEM_PROMPT,
@@ -696,7 +696,7 @@ interface AutoCandidateSearch {
 }
 
 /** Start of the retained tail, using Pi's cut-point policy with the conservative prompt estimator.
- * Pi accumulates chars/4, which understates CJK and tool output by 2-4x, so a `keepRecentTokens`
+ * Pi accumulates chars/4, which understates CJK and tool output by 2-4x, so a `keepRecent`
  * window measured that way retains far more real tokens than configured. The plugin summarizes the
  * same prefix Pi would, so a split turn's prefix is folded into the leading block instead of a
  * separate checkpoint. */
@@ -919,7 +919,7 @@ export async function runAutoCompression(deps: CompressDeps, inputState: PluginS
 
 	const entries = source;
 	const index = entryIndex(deps, entries);
-	const protectedFrom = protectedStart(entries, deps.cfg.keepRecentTokens);
+	const protectedFrom = protectedStart(entries, resolveTokenLimit(deps.cfg.keepRecent, deps.contextWindow));
 	const compressionStart = firstCompressibleIndex(entries);
 	let working = scoped.state;
 	// The prefix must already cover every compressible entry before the retained pointer. Raw

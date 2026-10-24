@@ -79,8 +79,8 @@ function entries(turns = 5): SessionEntry[] {
 function config(overrides: Partial<AutoCompactConfig> = {}): AutoCompactConfig {
 	return {
 		enabled: true,
-		reserveTokens: 16384,
-		keepRecentTokens: 100,
+		trigger: { mode: "percent", value: 0.85 },
+		keepRecent: { mode: "tokens", value: 100 },
 		blockTokenCeiling: 1000,
 		blockMergeThreshold: 3,
 		maxBlocks: { enabled: false, value: 8 },
@@ -173,7 +173,7 @@ test("automatic compaction starts at the first context-visible message after met
 		{ type: "message", id: "tail", parentId: "current", timestamp: "2026-01-01T00:00:04.000Z", message: { role: "assistant", content: [{ type: "text", text: "working" }], timestamp: 0 } } as unknown as SessionEntry,
 	];
 	let prompt = "";
-	const operation = deps(config({ keepRecentTokens: 1 }), async (value) => {
+	const operation = deps(config({ keepRecent: { mode: "tokens", value: 1 } }), async (value) => {
 		prompt = renderPromptParts(value);
 		return VALID_SUMMARY;
 	}, branch);
@@ -196,7 +196,7 @@ test("prompt state is never summarized and never covered by a block", async () =
 		{ type: "message", id: "tail", parentId: "current", timestamp: "2026-01-01T00:00:04.000Z", message: { role: "assistant", content: [{ type: "text", text: "working" }], timestamp: 0 } } as unknown as SessionEntry,
 	];
 	let prompt = "";
-	const operation = deps(config({ keepRecentTokens: 1 }), async (value) => {
+	const operation = deps(config({ keepRecent: { mode: "tokens", value: 1 } }), async (value) => {
 		prompt = renderPromptParts(value);
 		return VALID_SUMMARY;
 	}, branch);

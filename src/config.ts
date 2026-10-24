@@ -2,15 +2,20 @@
 
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { CONFIG_DIR_NAME, DEFAULT_COMPACTION_SETTINGS, getAgentDir } from "@earendil-works/pi-coding-agent";
+import { CONFIG_DIR_NAME, getAgentDir } from "@earendil-works/pi-coding-agent";
+
+/** A limit written either as an absolute token count or as a share of the context window. */
+export type TokenLimit =
+	| { mode: "tokens"; value: number }
+	| { mode: "percent"; value: number };
 
 export interface AutoCompactConfig {
 	/** Whether threshold and overflow requests should run automatic compaction. */
 	enabled: boolean;
-	/** Start automatic compaction once the plugin's projected context estimate exceeds (window - reserveTokens). */
-	reserveTokens: number;
-	/** Recent conversation tokens kept verbatim; measured with the conservative prompt estimator. */
-	keepRecentTokens: number;
+	/** Start automatic compaction once the plugin's projected context estimate reaches this limit. */
+	trigger: TokenLimit;
+	/** Recent conversation kept verbatim; measured with the conservative prompt estimator. */
+	keepRecent: TokenLimit;
 	/** Maximum tokens in the complete card sent to the main model. */
 	blockTokenCeiling: number;
 	/** k: after the (k + 1)th same-level block appears, merge the oldest k. */
@@ -26,9 +31,9 @@ export interface AutoCompactConfig {
 
 export const DEFAULT_CONFIG: AutoCompactConfig = {
 	enabled: true,
-	// Compaction trigger and retained window follow Pi's own compaction settings.
-	reserveTokens: DEFAULT_COMPACTION_SETTINGS.reserveTokens,
-	keepRecentTokens: DEFAULT_COMPACTION_SETTINGS.keepRecentTokens,
+	// Window shares, so switching models rescales both limits without editing the file.
+	trigger: { mode: "percent", value: 0.85 },
+	keepRecent: { mode: "percent", value: 0.25 },
 	blockTokenCeiling: 2000,
 	blockMergeThreshold: 3,
 	maxBlocks: { enabled: true, value: 8 },
@@ -77,8 +82,10 @@ export function saveConfig(cwd: string, includeProject: boolean, config: AutoCom
 /** Enforce the state-machine invariants once at load time. */
 export function validateConfig(config: AutoCompactConfig): void {
 	if (typeof config.enabled !== "boolean") throw new Error("enabled must be a boolean");
-	for (const [name, value] of [["reserveTokens", config.reserveTokens], ["keepRecentTokens", config.keepRecentTokens]] as const) {
-		if (!Number.isInteger(value) || value <= 0) throw new Error(`${name} must be a positive integer`);
+	for (const [name, limit] of [["trigger", config.trigger], ["keepRecent", config.keepRecent]] as const) {
+		if (limit.mode !== "tokens" && limit.mode !== "percent") throw new Error(`${name}.mode must be "tokens" or "percent"`);
+		if (!Number.isFinite(limit.value) || limit.value <= 0) throw new Error(`${name}.value must be a positive number`);
+		if (limit.mode === "percent" && limit.value > 1) throw new Error(`${name}.value must be <= 1 in percent mode`);
 	}
 	if (!Number.isInteger(config.blockMergeThreshold) || config.blockMergeThreshold < 2) {
 		throw new Error("blockMergeThreshold must be an integer >= 2");
@@ -95,4 +102,10 @@ export function validateConfig(config: AutoCompactConfig): void {
 		throw new Error("page sizes must be integers with 256 <= defaultPageSize <= maxPageSize");
 	}
 	if (config.debug !== undefined && typeof config.debug !== "boolean") throw new Error("debug must be a boolean");
+}
+
+/** Turn a limit into an absolute token count. Percent limits are shares of the context window,
+ * so callers must resolve them per request: the window changes with the active model. */
+export function resolveTokenLimit(limit: TokenLimit, contextWindow: number): number {
+	return Math.floor(limit.mode === "tokens" ? limit.value : contextWindow * limit.value);
 }
