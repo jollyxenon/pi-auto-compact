@@ -9,7 +9,7 @@ import {
 	type CompressDeps,
 } from "../src/compress.ts";
 import type { AutoCompactConfig } from "../src/config.ts";
-import { SUMMARY_TOOL_NAME } from "../src/summarizer.ts";
+import { SUMMARY_THINKING_RESERVE, SUMMARY_TOOL_NAME } from "../src/summarizer.ts";
 import { freshState, type PluginState, type PromptPart, type SummaryResponse } from "../src/types.ts";
 import { messageToText, renderPromptParts, type TokenEstimator } from "../src/util.ts";
 
@@ -137,6 +137,53 @@ test("maxBlocks is optional and constrains only the stable top-level layout", as
 	assert.deepEqual(topLevelLayout(state).map((item) => item.level), [2]);
 });
 
+test("an over-budget card is condensed by a card-only retry instead of failing the operation", async () => {
+	const oversized = {
+		...VALID_OUTPUT,
+		progress: {
+			done: Array.from({ length: 200 }, (_, index) => `done item ${index} ${"x".repeat(40)}`),
+			doing: [],
+			todo: [],
+		},
+	};
+	let calls = 0;
+	let retryPrompt = "";
+	const operation = deps(config({ blockTokenCeiling: 1000 }), async (content) => {
+		calls++;
+		if (calls === 1) return { text: "", toolCalls: [{ type: "toolCall", id: "c1", name: SUMMARY_TOOL_NAME, arguments: oversized }] };
+		retryPrompt = renderPromptParts(content);
+		return summaryResponse();
+	});
+	const outcome = await runManualCompression(operation, freshState(), "e0", "e1");
+	assert.ok(outcome.state, outcome.reason);
+	assert.equal(calls, 2, "one initial request plus one condense retry");
+	assert.match(retryPrompt, /Compaction Block to Condense/);
+	assert.doesNotMatch(retryPrompt, /<target_compaction_range>/, "the condense retry must not resend the target range");
+	assert.ok((outcome.createdBlocks?.[0].cardTokens ?? Number.MAX_SAFE_INTEGER) <= 1000);
+});
+
+test("a card that stays over budget is accepted while net gain still holds", async () => {
+	const oversized = {
+		...VALID_OUTPUT,
+		progress: {
+			done: Array.from({ length: 200 }, (_, index) => `done item ${index} ${"x".repeat(40)}`),
+			doing: [],
+			todo: [],
+		},
+	};
+	let calls = 0;
+	const operation = deps(config({ blockTokenCeiling: 1000 }), async () => {
+		calls++;
+		return { text: "", toolCalls: [{ type: "toolCall", id: "c1", name: SUMMARY_TOOL_NAME, arguments: oversized }] };
+	});
+	const outcome = await runManualCompression(operation, freshState(), "e0", "e3");
+	assert.ok(outcome.state, outcome.reason);
+	assert.equal(calls, 3, "the retry loop is bounded");
+	const block = outcome.createdBlocks?.[0];
+	assert.ok((block?.cardTokens ?? 0) > 1000, "the card is still over the ceiling");
+	assert.ok((block?.cardTokens ?? 0) < (block?.sourceTokens ?? 0), "net gain is the only hard gate");
+});
+
 test("a merge summary failure leaves the input state unchanged", async () => {
 	const state = await compactTurns(3);
 	const before = JSON.stringify(state);
@@ -204,6 +251,24 @@ test("summary request budget is checked before calling the model", async () => {
 	const outcome = await runManualCompression(operation, freshState(), "e0", "e0");
 	assert.match(outcome.reason ?? "", /summary request needs/);
 	assert.equal(called, false);
+
+	// Enabling summaryReasoning charges SUMMARY_THINKING_RESERVE in the planner's window check.
+	const smallBranch: SessionEntry[] = [
+		{ type: "message", id: "e0", parentId: null, timestamp: "2026-01-01T00:00:00.000Z", message: { role: "user", content: "x".repeat(2000), timestamp: 0 } } as SessionEntry,
+		{ type: "message", id: "e1", parentId: "e0", timestamp: "2026-01-01T00:00:01.000Z", message: { role: "assistant", content: [{ type: "text", text: "done" }], timestamp: 0 } } as unknown as SessionEntry,
+		{ type: "message", id: "e2", parentId: "e1", timestamp: "2026-01-01T00:00:02.000Z", message: { role: "user", content: "next", timestamp: 0 } } as SessionEntry,
+	];
+	const withoutThinking = deps(config({ blockTokenCeiling: 1000 }), async () => summaryResponse(), smallBranch);
+	withoutThinking.contextWindow = 10_000;
+	const ok = await runManualCompression(withoutThinking, freshState(), "e0", "e0");
+	assert.ok(ok.state, ok.reason);
+
+	const withThinking = deps(config({ blockTokenCeiling: 1000 }), async () => summaryResponse(), smallBranch);
+	withThinking.summaryReasoning = true;
+	withThinking.contextWindow = 10_000;
+	const rejected = await runManualCompression(withThinking, freshState(), "e0", "e0");
+	assert.match(rejected.reason ?? "", /summary request needs/);
+	assert.ok(SUMMARY_THINKING_RESERVE > 0);
 });
 
 test("manual compaction rejects overlap and incomplete tail", async () => {

@@ -73,7 +73,7 @@ pi -e /home/xenon/pi-auto-compact
 
 `trigger` 和 `keepRecent` 都是 `{ "mode": "tokens" | "percent", "value": 数值 }`：`tokens` 模式是绝对 token 数，`percent` 模式是**窗口占比**（0~1 的小数）。`trigger` 表示“投影上下文达到多少就开始压缩”，`keepRecent` 表示“最近多少内容保持原文”。默认是 `0.85` / `0.25`，即窗口用到 85% 触发、保留最近 25% 窗口的原文。
 
-百分比不能写死在配置里：窗口随当前模型变化，所以 `percent` 只在每次请求时用当时的 `contextWindow` 换算成绝对值，配置文件中永远只存 0~1 的占比。窗口未知（provider 不报告）时百分比无法换算，本次不压缩。两个值都按插件的保守提示词口径（`estimateMessageTokens`）计量，所以“保留 25% 窗口”指的是插件估算口径的 25%，不是 provider 口径。`blockTokenCeiling` 与 `minNetGainTokens` 是卡片预算和最低净收益。默认 `blockTokenCeiling: 2000` 意味着卡片正文的实际提示词量级不超过约 2000 token（旧口径下同一数字实际放行到约 5400 token），所以如果你希望卡片保持原来的长度，应该把它调到 4000~6000。Pi 的 `settings.json` 里的 `compaction` 设置只在插件未接管前有效，插件启用期间不再决定触发时机或保留量。
+百分比不能写死在配置里：窗口随当前模型变化，所以 `percent` 只在每次请求时用当时的 `contextWindow` 换算成绝对值，配置文件中永远只存 0~1 的占比。窗口未知（provider 不报告）时百分比无法换算，本次不压缩。两个值都按插件的保守提示词口径（`estimateMessageTokens`）计量，所以“保留 25% 窗口”指的是插件估算口径的 25%，不是 provider 口径。`blockTokenCeiling` 是卡片目标大小，`minNetGainTokens` 是提交卡片的最低净收益。默认 `blockTokenCeiling: 2000` 表示提示词要求模型把卡片正文控制在约 2000 token（旧口径下同一数字实际放行到约 5400 token），所以如果你希望卡片保持原来的长度，应该把它调到 4000~6000。它只是目标：卡片略微超限不会导致压缩失败，见下文“摘要边界”。Pi 的 `settings.json` 里的 `compaction` 设置只在插件未接管前有效，插件启用期间不再决定触发时机或保留量。
 
 两个值要一起看：`keepRecent` 换算出的绝对值必须明显小于 `trigger` 换算出的触发点，否则受保护尾部本身就填满了触发线，压缩找不到可处理区间。
 
@@ -168,9 +168,9 @@ pi -e /home/xenon/pi-auto-compact
 
 图片在摘要请求里按原始位置以图片块发送，因此按图片计费而不是按 base64 计费；只有当前模型不支持图片输入时才退化为 `[image <mime>, about <大小>KB omitted]` 占位符。`context_get` 的文本形式始终用占位符，原始数据用 `rawEntryJson`。不产生模型消息的 entry（例如其他扩展写入的 `custom` 展示记录、`model_change`、`thinking_level_change`）不是摘要素材：它们仍留在块的头尾区间内，`context_get` 照样能按区间取回，但正文 JSON 不出现在目标区或参考区——这些记录 Pi 在正常对话里也不会发给模型。entry 的 token 记账按 Pi 的消息投影计算（排除不产生模型消息的 entry），计量一律用保守提示词口径（CJK 约每字一 token，其余约每三字符一 token）：`sourceTokens`、卡片预算、净收益门限、进度、受保护尾部和 footer 全部同口径，图片按固定每图估算计费。摘要请求预算同样按实际提示词内容（含工具声明和图片块）用这个口径估算。这是启发式近似，不保证与提供方分词器完全一致，但可以避免 chars/4 在中文/代码内容上把超窗请求当成“放得下”。
 
-范围选择与请求发送共同使用 `max(2 * blockTokenCeiling, 2048)` 作为输出预留；实际请求还受模型输出上限约束。思考与摘要合计不能超过这一上限；范围选择额外预留 Pi 适配器的 4096 token 输入余量和 256 token 重写余量；重写请求本身是本次操作的最后一次请求，只镜像 4096 token 适配器余量，不再叠加 256 token 重写余量，否则第一次请求刚好放下的目标范围会因为重写指令而被判超窗。level-1 因净收益要求而缩小卡片预算时，不会错误地同步缩小请求输出预留。模型达到输出上限而未正常结束时，仍拒绝提交，不硬截断摘要。
+范围选择与请求发送共同使用 `max(3 * blockTokenCeiling, 2048)`（启用思考时再加 `4096` token 思考预留）作为输出上限；实际请求还受模型输出上限约束。摘要请求在关闭思考时保持关闭，否则将思考等级封顶到 `low`（再按模型支持的档位对齐），防止深度思考耗尽共享输出额度而触发 `length` 截断。思考与摘要合计不能超过这一上限；范围选择额外预留 Pi 适配器的 4096 token 输入余量和 256 token 重试余量。非最后一次尝试会保留这段重试余量，最后一次尝试只镜像 4096 token 适配器余量。卡片超限时不会重发整个目标区间，而是单独发一条只带该卡片的精简请求，因此重试请求远小于目标请求、总能放进窗口；如果连精简请求也放不下，就直接接受当前卡片而不报错。level-1 因净收益要求而缩小卡片预算时，不会错误地同步缩小请求输出预留。模型达到输出上限而未正常结束时，仍拒绝提交，不硬截断摘要。
 
-摘要采用固定输出协议：模型不写自由文本，而是调用一次 schema 约束的工具 `emit_compaction_block`。参数由 `SUMMARY_SCHEMA` 定义：不超过 50 字符的单行 `overview`（只写入块元数据，供 `/auto-compact-blocks` 的树视图显示），以及 `progress.done`、`progress.doing`、`progress.todo`、`blocked`、`decision`、`critical_content`、`read_files`、`modified_files` 各字段，全部必填。工具带 `constrainedSampling: { type: "json_schema", strict: "prefer" }`：提供方支持严格 JSON-schema 约束采样时，参数合法性由提供方在服务端保证；不支持时退化为普通工具调用，由插件用 `Value.Errors` 按同一 schema 校验。模型完全不调用工具时，插件才退一步从响应文本里提取第一个 `{…}` 再校验。校验通过的字段由 `renderSummaryCard` 渲染成固定顺序的 `<progress>`（含 `<done>`、`<doing>`、`<todo>`）、`<blocked>`、`<decision>`、`<critical_content>`、`<read_files>`、`<modified_files>` 卡片文本存入块，所以卡片形状和标签顺序不再靠正则事后检查。工具声明本身约 468 token，已计入每次摘要请求的输入预算估算。level-1 完整卡片预算同时受 `blockTokenCeiling` 和 `minNetGainTokens` 约束，两者都按保守提示词口径（`estimateMessageTokens`）计量：`blockTokenCeiling: 2000` 意味着卡片正文的实际提示词量级不超过约 2000 token，而不再是被 chars/4 放大后的约 5400 token。确保生成结果达到最低净收益；第一次输出不合格时重写一次，仍不合格则整次操作回滚。插件不会硬截断摘要。
+摘要采用固定输出协议：模型不写自由文本，而是调用一次 schema 约束的工具 `emit_compaction_block`。参数由 `SUMMARY_SCHEMA` 定义：不超过 50 字符的单行 `overview`（只写入块元数据，供 `/auto-compact-blocks` 的树视图显示），以及 `progress.done`、`progress.doing`、`progress.todo`、`blocked`、`decision`、`critical_content`、`read_files`、`modified_files` 各字段，全部必填。工具带 `constrainedSampling: { type: "json_schema", strict: "prefer" }`：提供方支持严格 JSON-schema 约束采样时，参数合法性由提供方在服务端保证；不支持时退化为普通工具调用，由插件用 `Value.Errors` 按同一 schema 校验。模型完全不调用工具时，插件才退一步从响应文本里提取第一个 `{…}` 再校验。校验通过的字段由 `renderSummaryCard` 渲染成固定顺序的 `<progress>`（含 `<done>`、`<doing>`、`<todo>`）、`<blocked>`、`<decision>`、`<critical_content>`、`<read_files>`、`<modified_files>` 卡片文本存入块，所以卡片形状和标签顺序不再靠正则事后检查。工具声明本身约 468 token，已计入每次摘要请求的输入预算估算。level-1 的卡片目标同时受 `blockTokenCeiling` 和 `minNetGainTokens` 约束，两者都按保守提示词口径（`estimateMessageTokens`）计量：`blockTokenCeiling: 2000` 表示提示词要求卡片正文不超过约 2000 token，而不再是被 chars/4 放大后的约 5400 token。`blockTokenCeiling` 是目标而非提交门：卡片超限但形状合法时，插件单独发一条只带该卡片的精简请求，要求模型合并、删减到预算以内（最多 3 次尝试）；形状非法或无法解析时才带原目标区间重问。重试用尽后仍超限的卡片，只要净收益达标就照常提交，只有净收益不达标（卡片没有明显小于源区间）才整次操作回滚。插件不会硬截断摘要。
 
 ## 状态与故障语义
 
@@ -184,7 +184,7 @@ pi -e /home/xenon/pi-auto-compact
 
 每次有效状态变化还会在会话末尾追加一条 `custom` 展示快照（`auto-compact-snapshot`）。它是派生展示记录，不是有效状态的一部分：丢失、写入失败或不存在都不影响投影和下一次压缩，插件也不会用它恢复块树。展示快照因而不参与模型上下文、摘要目标、参考材料和 token 记账。
 
-每次摘要请求完成时还会追加一条 `auto-compact-usage` 的 `custom` entry，记录 provider 回传的用量（含失败后重写的那次，以及输出后来校验失败的那次——token 已经花掉）。它同样不参与模型上下文和投影，只用于 footer 的累计 token 与费用。没有对应的 entry renderer，Pi 会直接跳过不显示。
+每次摘要请求完成时还会追加一条 `auto-compact-usage` 的 `custom` entry，记录 provider 回传的用量（含失败后重试的那次，以及输出后来校验失败的那次——token 已经花掉）。它同样不参与模型上下文和投影，只用于 footer 的累计 token 与费用。没有对应的 entry renderer，Pi 会直接跳过不显示。
 
 插件取消 Pi 原生压缩，并始终接管手动、threshold 和 overflow 压缩；即使插件没有产出可提交状态（例如收益不足、摘要失败或请求预算不足）也取消原生行为，不回退到原生 compact。`threshold` 请求只取消、不压缩：Pi 的阈值读的是 `settings.json` 的 `compaction.reserveTokens`，照它执行就等于让 Pi 的设置决定插件何时压缩、并让 `auto-compact.json` 的 `trigger` 失效。触发完全由插件在 `context` 事件里的检查负责；每个会话第一次忽略原生阈值请求时提示一次。`overflow` 是真实超窗，仍执行插件压缩。关闭自动压缩只停止插件的阈值扫描，不会因此放行原生压缩。插件等待摘要期间会阻止另一轮插件压缩并发启动，避免 session leaf 改变后丢弃结果。压缩进行中，`tree`/`fork`/`clone`/`new`/`resume` 会被取消，`/reload` 会在输入层被拦截；按下 Esc（包括空闲时发起的 `/auto-compact`）或退出（session_shutdown）会中断摘要请求及重试等待，并丢弃未提交的部分结果。若配置让受保护尾部本身接近或超过模型窗口，自动压缩将找不到可处理区间；此时应降低 `keepRecent` 或 `trigger`，再执行 `/auto-compact-config`。
 

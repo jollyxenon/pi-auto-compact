@@ -8,10 +8,11 @@ import {
 	SUMMARIZER_SYSTEM_PROMPT,
 	SUMMARY_TOOL_TOKENS,
 	buildSummarizeParts,
+	buildCondenseParts,
 	cardTokensFor,
 	parseSummaryOutput,
 	renderSummaryCard,
-	rewriteInstruction,
+	retryInstruction,
 	summaryOutputTokenLimit,
 	validateSummaryCard,
 	type CompactSummaryOutput,
@@ -53,7 +54,11 @@ export interface CompressDeps {
 	estimate: TokenEstimator;
 	/** Whether the summary model accepts image input; otherwise images stay placeholders. */
 	supportsImages: boolean;
+	/** Whether summary requests enable reasoning, adding thinking headroom to the output limit. */
+	summaryReasoning?: boolean;
 	onProgress?: (progress: CompressProgress) => void;
+	/** Debug sink for summary decisions; never receives prompt text or summary content. */
+	onDebug?: (message: string, details?: unknown) => void;
 	summarizeFn: (content: PromptPart[]) => Promise<SummaryResponse>;
 	/** Per-operation memo of an entry's prompt parts and the tokens its messages cost. */
 	entryCache?: Map<string, { parts: PromptPart[]; tokens: number }>;
@@ -129,11 +134,13 @@ interface PreparedInput {
 }
 
 // Pi's streamSimple clamps maxTokens against contextWindow - CONTEXT_SAFETY_TOKENS, so every
-// request estimate mirrors that 4096-token input margin. A first attempt additionally leaves room
-// for the structural rewrite, because the rewrite resends the same content plus a longer
-// instruction; the rewrite itself is the last request of the operation and needs no further room.
+// request estimate mirrors that 4096-token input margin. A non-final attempt additionally reserves
+// room for the follow-up instruction; a condense retry carries only the previous card, so it is
+// far smaller than the target request and never needs the target's headroom.
 const SUMMARY_ADAPTER_MARGIN = 4096;
-const SUMMARY_REWRITE_RESERVE = 256;
+const SUMMARY_RETRY_RESERVE = 256;
+/** One initial summary request plus at most two condense retries. */
+const SUMMARY_MAX_ATTEMPTS = 3;
 
 /** Stop an operation before it can produce or commit a result. */
 function throwIfAborted(deps: CompressDeps): void {
@@ -238,15 +245,15 @@ export function resolveCompactedPrefix(entries: SessionEntry[], state: PluginSta
 	return { retainedFrom, firstKeptEntryId: entries[retainedFrom]?.id };
 }
 
-/** Estimate one summary request: the adapter margin always applies, and a first attempt also
- * carries the rewrite reserve so the follow-up request still fits the window. */
-function summaryRequestTokensForParts(deps: CompressDeps, parts: PromptPart[], mayRewrite = true): number {
+/** Estimate one summary request: the adapter margin always applies, and a non-final attempt also
+ * carries the follow-up instruction so the next request still fits the window. */
+function summaryRequestTokensForParts(deps: CompressDeps, parts: PromptPart[], mayRetry = true): number {
 	return estimatePromptTokens(SUMMARIZER_SYSTEM_PROMPT)
 		+ SUMMARY_TOOL_TOKENS
 		+ estimatePromptPartTokens(parts)
-		+ summaryOutputTokenLimit(deps.cfg.blockTokenCeiling)
+		+ summaryOutputTokenLimit(deps.cfg.blockTokenCeiling, deps.summaryReasoning)
 		+ SUMMARY_ADAPTER_MARGIN
-		+ (mayRewrite ? SUMMARY_REWRITE_RESERVE : 0);
+		+ (mayRetry ? SUMMARY_RETRY_RESERVE : 0);
 }
 
 /** Estimate the complete request that would be sent to the summary model. */
@@ -401,6 +408,8 @@ interface SummaryRead {
 	card?: string;
 	cardTokens?: number;
 	problems: string[];
+	/** The card parsed cleanly but exceeded its budget; a target miss, not an invalid output. */
+	overBudget: boolean;
 }
 
 async function summarizeBlock(
@@ -418,37 +427,73 @@ async function summarizeBlock(
 	// produced by the renderer, so only the output contract and the budget can fail here.
 	const read = (response: SummaryResponse): SummaryRead => {
 		const parsed = parseSummaryOutput(response.toolCalls, response.text);
-		if (!parsed.output) return { problems: parsed.problems };
+		if (!parsed.output) return { problems: parsed.problems, overBudget: false };
 		const card = renderSummaryCard(parsed.output);
 		const cardTokens = cardTokensFor(state.nextSeq, input, card, deps.estimate);
-		return { output: parsed.output, card, cardTokens, problems: validateSummaryCard(cardTokens, input.budgetTokens).problems };
+		const validation = validateSummaryCard(cardTokens, input.budgetTokens);
+		return { output: parsed.output, card, cardTokens, problems: validation.problems, overBudget: validation.overBudget };
 	};
-	let summary = read(await deps.summarizeFn(content));
+	// The card budget is a target, not a gate. A model that overshoots it must not deadlock
+	// compaction, so the smallest parseable card survives every failed retry and is committed as
+	// long as the caller's net-gain check accepts it; only an unusable output aborts the operation.
+	let accepted: SummaryRead | undefined;
+	const consider = (candidate: SummaryRead): void => {
+		if (!candidate.output || candidate.cardTokens === undefined) return;
+		if (!accepted || candidate.cardTokens < (accepted.cardTokens ?? Number.MAX_SAFE_INTEGER)) accepted = candidate;
+	};
+	let attempts = 0;
+	let latest = read(await deps.summarizeFn(content));
+	attempts++;
 	throwIfAborted(deps);
-	if (summary.problems.length > 0) {
-		const rewriteContent: PromptPart[] = [...content, { type: "text", text: rewriteInstruction(summary.problems) }];
-		const rewriteRequestTokens = summaryRequestTokensForParts(deps, rewriteContent, false);
-		if (rewriteRequestTokens > deps.contextWindow) {
-			return { error: `summary rewrite needs about ${rewriteRequestTokens} tokens, window is ${deps.contextWindow}` };
+	consider(latest);
+	while (latest.problems.length > 0 && attempts < SUMMARY_MAX_ATTEMPTS) {
+		// A parseable but oversized card is condensed on its own, so the retry request stays tiny
+		// and always fits; an unusable response is re-asked with the original target range.
+		const condenseFrom = accepted?.output ?? latest.output;
+		const retryContent: PromptPart[] = condenseFrom
+			? buildCondenseParts(input, condenseFrom)
+			: [...content, { type: "text", text: retryInstruction(latest.problems) }];
+		if (summaryRequestTokensForParts(deps, retryContent, attempts + 1 < SUMMARY_MAX_ATTEMPTS) > deps.contextWindow) {
+			deps.onDebug?.("summary retry skipped: it would not fit the window", {
+				attempt: attempts,
+				overBudget: latest.overBudget,
+			});
+			break;
 		}
-		summary = read(await deps.summarizeFn(rewriteContent));
+		deps.onDebug?.("summary retry requested", {
+			attempt: attempts,
+			overBudget: latest.overBudget,
+			problems: latest.problems,
+		});
+		latest = read(await deps.summarizeFn(retryContent));
+		attempts++;
 		throwIfAborted(deps);
+		consider(latest);
 	}
-	if (summary.problems.length > 0 || !summary.output || summary.card === undefined || summary.cardTokens === undefined) {
-		return { error: summary.problems.join("; ") };
+	const chosen = accepted;
+	if (!chosen || chosen.output === undefined || chosen.card === undefined || chosen.cardTokens === undefined) {
+		return { error: latest.problems.join("; ") || "the summary model produced no usable block" };
+	}
+	if (chosen.overBudget) {
+		deps.onDebug?.("summary card accepted over budget", {
+			cardTokens: chosen.cardTokens,
+			budgetTokens: input.budgetTokens,
+			sourceTokens: input.sourceTokens,
+			attempts,
+		});
 	}
 	return {
 		block: {
 			blockId: nextBlockId(state.nextSeq),
 			level: input.level,
-			overview: summary.output.overview.trim(),
+			overview: chosen.output.overview.trim(),
 			startEntryId: input.sourceEntryIds[0] ?? "",
 			endEntryId: input.sourceEntryIds.at(-1) ?? "",
 			childBlockIds: [...input.childBlockIds],
-			summary: summary.card,
+			summary: chosen.card,
 			createdAt: new Date().toISOString(),
 			sourceTokens: input.sourceTokens,
-			cardTokens: summary.cardTokens,
+			cardTokens: chosen.cardTokens,
 		},
 	};
 }

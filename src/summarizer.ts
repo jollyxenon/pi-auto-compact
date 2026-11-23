@@ -1,7 +1,7 @@
 /** Strict summary protocol shared by automatic and manual operations. */
 
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
-import type { Tool, ToolCall } from "@earendil-works/pi-ai";
+import { clampThinkingLevel, type Api, type Model, type ModelThinkingLevel, type Tool, type ToolCall } from "@earendil-works/pi-ai";
 import { Type, type Static } from "typebox";
 import { Value } from "typebox/value";
 import type { PromptPart, SummarizeInput } from "./types.ts";
@@ -10,9 +10,28 @@ import { estimatePromptTokens, nextBlockId, renderBlockCard, type TokenEstimator
 export const SUMMARIZER_SYSTEM_PROMPT =
 	"You are requested to compress the context of this session. Compress according to the format specifications provided below.";
 
-/** Reserve one fixed output cap for both planning and provider requests. */
-export function summaryOutputTokenLimit(blockTokenCeiling: number): number {
-	return Math.max(blockTokenCeiling * 2, 2048);
+/** Thinking headroom reserved when summary reasoning is enabled so shared-budget models
+ * (e.g. Gemini via OpenAI completions) do not exhaust output tokens before emitting the tool call. */
+export const SUMMARY_THINKING_RESERVE = 4096;
+
+/** Cap summary reasoning at `low` (respecting `off` / `minimal` and model capabilities),
+ * so deep session thinking never burns the output budget or stalls compaction. */
+export function resolveSummaryThinkingLevel(
+	model: Model<Api>,
+	thinkingLevel: ModelThinkingLevel | undefined,
+): Exclude<ModelThinkingLevel, "off"> | undefined {
+	if (!model.reasoning || !thinkingLevel || thinkingLevel === "off") return undefined;
+	const capped: ModelThinkingLevel = thinkingLevel === "minimal" ? "minimal" : "low";
+	const clamped = clampThinkingLevel(model, capped);
+	return clamped === "off" ? undefined : clamped;
+}
+
+/** Reserve one fixed output cap for both planning and provider requests. It is a ceiling, not a
+ * target: the prompt asks for `blockTokenCeiling`, and the extra headroom keeps a model that
+ * overshoots from being cut off mid-call, so the over-budget card can still be condensed.
+ * When reasoning is enabled, `SUMMARY_THINKING_RESERVE` is added so thinking never crowds out the card. */
+export function summaryOutputTokenLimit(blockTokenCeiling: number, hasReasoning = false): number {
+	return Math.max(3 * blockTokenCeiling, 2048) + (hasReasoning ? SUMMARY_THINKING_RESERVE : 0);
 }
 
 /** One-sentence overview length limit used by the compaction protocol. */
@@ -211,8 +230,29 @@ export function validateSummaryCard(cardTokens: number, budgetTokens: number): S
 	};
 }
 
-export function rewriteInstruction(problems: string[]): string {
-	return `\n\nThe previous output was invalid (${problems.join("; ")}). Call the \`${SUMMARY_TOOL_NAME}\` tool once with the complete compaction block: fill every field, keep \`overview\` to one line of at most ${OVERVIEW_MAX_CHARS} characters, and stay inside the card budget. Do not answer with text.`;
+export function retryInstruction(problems: string[]): string {
+	return `\n\nYour previous response was rejected (${problems.join("; ")}). Call the \`${SUMMARY_TOOL_NAME}\` tool once with the complete compaction block: fill every field, keep \`overview\` to one line of at most ${OVERVIEW_MAX_CHARS} characters, and stay inside the card budget. Do not answer with text.`;
+}
+
+/** Condense an already-valid block that overshot its budget. The request carries only the block,
+ * never the target range, so it is cheap and always fits inside the same window. */
+export function buildCondenseParts(input: SummarizeInput, previous: CompactSummaryOutput): PromptPart[] {
+	return [{ type: "text", text: `# Context Compaction
+
+## Compaction Specifications
+
+- The compaction block below is valid in shape but longer than its budget of ${input.budgetTokens} Token;
+- Call the \`${SUMMARY_TOOL_NAME}\` tool exactly once with a denser block that stays within ${input.budgetTokens} Token; NEVER answer with text and NEVER wrap the call in a code fence;
+- Merge items that overlap, drop items already implied by another item, and shorten every remaining item;
+- Keep every field present, keep the same coverage, and never invent content the block does not contain;
+- \`overview\` is limited to one sentence, not exceeding ${OVERVIEW_MAX_CHARS} characters.
+
+## Compaction Block to Condense
+
+\`\`\`json
+${JSON.stringify(previous)}
+\`\`\`
+` }];
 }
 
 /** Estimate the final visible card using the real message estimator. */

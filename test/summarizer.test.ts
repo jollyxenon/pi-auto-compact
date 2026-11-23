@@ -1,12 +1,19 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { createAssistantMessageEventStream, type Model } from "@earendil-works/pi-ai";
+import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { defaultConfig } from "../src/config.ts";
 import {
+	SUMMARY_THINKING_RESERVE,
 	SUMMARY_TOOL_NAME,
 	buildSummarizeParts,
 	parseSummaryOutput,
 	renderSummaryCard,
+	resolveSummaryThinkingLevel,
+	summaryOutputTokenLimit,
 	validateSummaryCard,
 } from "../src/summarizer.ts";
+import { createSummarizeFn } from "../src/summaryClient.ts";
 import type { SummarizeInput } from "../src/types.ts";
 import { renderPromptParts } from "../src/util.ts";
 
@@ -90,4 +97,86 @@ test("summary validation only guards the rendered card budget", () => {
 	const overflow = validateSummaryCard(501, 500);
 	assert.equal(overflow.overBudget, true);
 	assert.equal(overflow.ok, false);
+});
+
+test("summary thinking level caps deep session thinking to low and reserves thinking tokens", () => {
+	const geminiLike = {
+		id: "group/gemini-4-hydrogen",
+		name: "gemini-4-hydrogen",
+		api: "openai-completions",
+		provider: "magpie",
+		baseUrl: "http://127.0.0.1:31110/v1",
+		reasoning: true,
+		input: ["text"],
+		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+		contextWindow: 1048576,
+		maxTokens: 262144,
+		thinkingLevelMap: { off: null, minimal: null, low: "low", medium: "medium", high: "high", xhigh: "xhigh", max: null },
+	} as unknown as Model<"openai-completions">;
+	assert.equal(resolveSummaryThinkingLevel(geminiLike, "xhigh"), "low");
+	assert.equal(resolveSummaryThinkingLevel(geminiLike, "max"), "low");
+	assert.equal(resolveSummaryThinkingLevel(geminiLike, "off"), undefined);
+	assert.equal(resolveSummaryThinkingLevel({ ...geminiLike, reasoning: false }, "xhigh"), undefined);
+	assert.equal(resolveSummaryThinkingLevel({ ...geminiLike, thinkingLevelMap: undefined }, "minimal"), "minimal");
+
+	assert.equal(summaryOutputTokenLimit(2000, false), 6000);
+	assert.equal(summaryOutputTokenLimit(2000, true), 6000 + SUMMARY_THINKING_RESERVE);
+});
+
+test("createSummarizeFn caps reasoning at low and reserves thinking tokens in streamSimple options", async () => {
+	const selected = {
+		id: "group/gemini-4-hydrogen",
+		name: "gemini-4-hydrogen",
+		api: "openai-completions",
+		provider: "magpie",
+		baseUrl: "http://127.0.0.1:31110/v1",
+		reasoning: true,
+		input: ["text", "image"],
+		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+		contextWindow: 1048576,
+		maxTokens: 262144,
+		thinkingLevelMap: { off: null, minimal: null, low: "low", medium: "medium", high: "high", xhigh: "xhigh", max: null },
+	} as unknown as Model<"openai-completions">;
+
+	let capturedModelMaxTokens: number | undefined;
+	let capturedOptions: { reasoning?: unknown; maxTokens?: number } | undefined;
+	const ctx = {
+		cwd: process.cwd(),
+		model: selected,
+		thinkingLevel: "xhigh",
+		isProjectTrusted: () => true,
+		sessionManager: { getSessionId: () => "test-session" },
+		modelRegistry: {
+			getProvider: () => ({
+				streamSimple: (model: Model<any>, _context: unknown, options: { reasoning?: unknown; maxTokens?: number }) => {
+					capturedModelMaxTokens = model.maxTokens;
+					capturedOptions = options;
+					const stream = createAssistantMessageEventStream();
+					const msg = {
+						role: "assistant" as const,
+						api: model.api,
+						provider: model.provider,
+						model: model.id,
+						stopReason: "toolUse" as const,
+						timestamp: Date.now(),
+						content: [toolCall(output)],
+						usage: { input: 10, output: 20, cacheRead: 0, cacheWrite: 0, totalTokens: 30, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
+					};
+					stream.push({ type: "done", reason: "toolUse", message: msg });
+					stream.end();
+					return stream;
+				},
+			}),
+			getApiKeyAndHeaders: async () => ({ ok: true as const, apiKey: "test-key", headers: {} }),
+		},
+	} as unknown as ExtensionContext;
+
+	const cfg = { ...defaultConfig(), blockTokenCeiling: 2000 };
+	const summarize = createSummarizeFn(ctx, cfg, undefined, () => {}, () => {});
+	assert.ok(summarize);
+	const result = await summarize([{ type: "text", text: "hello" }]);
+	assert.equal(result.toolCalls[0]?.name, SUMMARY_TOOL_NAME);
+	assert.equal(capturedOptions?.reasoning, "low");
+	assert.equal(capturedOptions?.maxTokens, 6000 + SUMMARY_THINKING_RESERVE);
+	assert.equal(capturedModelMaxTokens, 6000 + SUMMARY_THINKING_RESERVE);
 });

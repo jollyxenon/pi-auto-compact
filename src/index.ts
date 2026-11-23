@@ -38,6 +38,7 @@ import {
 	unmatchedMessagesOutsideBlocks,
 } from "./mapping.ts";
 import { loadState, saveState, statePathFor } from "./state.ts";
+import { resolveSummaryThinkingLevel } from "./summarizer.ts";
 import { createSummarizeFn } from "./summaryClient.ts";
 import { freshState, SNAPSHOT_CUSTOM_TYPE, SUMMARY_USAGE_CUSTOM_TYPE, type CompactSnapshotData, type EntryMessageMapping, type PluginState, type SummaryUsage } from "./types.ts";
 import { estimateMessageTokens, messageToText, renderBlockCard } from "./util.ts";
@@ -468,6 +469,7 @@ export default function autoCompactExtension(pi: ExtensionAPI) {
 		const contextWindow = usage?.contextWindow ?? ctx.model?.contextWindow ?? 0;
 		const summarizeFn = createSummarizeFn(ctx, cfg, signal, debugLog, (entry) => pendingSummaryUsage.push(entry));
 		if (!summarizeFn || contextWindow <= 0) return null;
+		const summaryReasoning = ctx.model ? resolveSummaryThinkingLevel(ctx.model, ctx.thinkingLevel) !== undefined : false;
 		return {
 			cfg,
 			sessionKey: currentSessionKey(ctx),
@@ -482,7 +484,9 @@ export default function autoCompactExtension(pi: ExtensionAPI) {
 			// card budget, net gain and progress are comparable with the retained tail and the footer.
 			estimate: estimateMessageTokens,
 			supportsImages: ctx.model?.input?.includes("image") ?? false,
+			summaryReasoning,
 			onProgress: (progress) => updateCompression(ctx, progress),
+			onDebug: debugLog,
 			summarizeFn,
 			signal,
 		};

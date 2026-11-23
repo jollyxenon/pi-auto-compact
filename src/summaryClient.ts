@@ -3,7 +3,7 @@
 import { normalizeContext, retryAssistantCall, type ToolCall } from "@earendil-works/pi-ai";
 import { getAgentDir, SettingsManager, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { AutoCompactConfig } from "./config.ts";
-import { SUMMARIZER_SYSTEM_PROMPT, SUMMARY_TOOL, SUMMARY_TOOL_TOKENS, summaryOutputTokenLimit } from "./summarizer.ts";
+import { SUMMARIZER_SYSTEM_PROMPT, SUMMARY_TOOL, SUMMARY_TOOL_TOKENS, resolveSummaryThinkingLevel, summaryOutputTokenLimit } from "./summarizer.ts";
 import type { PromptPart, SummaryResponse, SummaryUsage } from "./types.ts";
 import { estimatePromptPartTokens, estimatePromptTokens } from "./util.ts";
 
@@ -23,11 +23,12 @@ export function createSummarizeFn(
 	const retry = settings.getRetrySettings();
 	const providerRetry = settings.getProviderRetrySettings();
 	const idleTimeout = settings.getHttpIdleTimeoutMs();
-	const reasoning = ctx.thinkingLevel === "off" ? undefined : ctx.thinkingLevel;
+	const reasoning = resolveSummaryThinkingLevel(selected, ctx.thinkingLevel);
 	const sessionId = ctx.sessionManager.getSessionId();
-	// Some adapters add a thinking budget to maxTokens. Cap the request model too,
-	// so reasoning and the final summary stay inside the planner's output reserve.
-	const maxTokens = Math.min(selected.maxTokens, summaryOutputTokenLimit(cfg.blockTokenCeiling));
+	// Some adapters add a thinking budget to maxTokens, while others share one ceiling between
+	// reasoning and the answer. Cap reasoning to low and add the thinking reserve here too,
+	// so reasoning and the final summary both stay inside the planner's output reserve.
+	const maxTokens = Math.min(selected.maxTokens, summaryOutputTokenLimit(cfg.blockTokenCeiling, reasoning !== undefined));
 	const model = { ...selected, maxTokens };
 
 	return async (content: PromptPart[]): Promise<SummaryResponse> => {
